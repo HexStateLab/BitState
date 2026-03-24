@@ -251,15 +251,41 @@ static inline void hpcq_x(HPCQGraph *g, uint64_t site)
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════════
- * CZ GATE — EXACT in HPC
+ * CZ GATE — EXACT in HPC (INVOLUTION: CZ² = I)
  *
  * CZ is EXACT: w(a,b) = (-1)^(a·b).
  * Only |1,1⟩ picks up a phase of -1. All others unchanged.
  * Fidelity = 1.0. Always.
+ *
+ * KEY PROPERTY: CZ · CZ = I. If a CZ edge already exists between
+ * (site_a, site_b), applying CZ again CANCELS it (swap-remove).
+ * This keeps the edge count bounded by the actual entanglement
+ * structure rather than growing linearly with circuit depth.
  * ═══════════════════════════════════════════════════════════════════════════════ */
 
 static inline void hpcq_cz(HPCQGraph *g, uint64_t site_a, uint64_t site_b)
 {
+    /* Check for existing CZ edge between this pair — CZ² = I cancellation */
+    for (uint64_t e = 0; e < g->n_edges; e++) {
+        HPCQEdge *edge = &g->edges[e];
+        if (edge->type == HPCQ_EDGE_CZ &&
+            ((edge->site_a == site_a && edge->site_b == site_b) ||
+             (edge->site_a == site_b && edge->site_b == site_a))) {
+            /* Cancel: swap-remove this edge */
+            g->edges[e] = g->edges[--g->n_edges];
+            g->cz_edges--;
+
+            HPCQGateEntry entry = {
+                .type = HPCQ_GATE_CZ,
+                .site_a = site_a, .site_b = site_b,
+                .fidelity = 1.0
+            };
+            hpcq_log_gate(g, entry);
+            return;
+        }
+    }
+
+    /* No existing edge — add new one */
     hpcq_grow_edges(g);
 
     HPCQEdge *e = &g->edges[g->n_edges];
