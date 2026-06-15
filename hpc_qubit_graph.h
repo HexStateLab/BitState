@@ -285,16 +285,38 @@ static inline void hpcq_hadamard_absorb(HPCQGraph *g, uint64_t site)
 {
     static const double S = 0.7071067811865475244;  /* 1/√2 */
 
-    /* Count incident edges and find the first one */
+    /* Count incident non-absorbed edges */
     int n_inc = 0;
     uint64_t e_idx = 0;
 
     for (uint64_t e = 0; e < g->n_edges; e++) {
         HPCQEdge *edge = &g->edges[e];
+        if (edge->type == HPCQ_EDGE_ABSORBED) continue;
         if (edge->site_a == site || edge->site_b == site) {
             n_inc++;
             e_idx = e;
         }
+    }
+
+    /* Check if this site already has an absorb entry (re-apply H) */
+    int existing_absorb = -1;
+    for (uint64_t a = 0; a < g->n_absorb; a++) {
+        if (g->absorb[a].center == site) { existing_absorb = (int)a; break; }
+    }
+
+    if (existing_absorb >= 0) {
+        /* Site was previously multi-edge absorbed.  Removing the absorb entry
+         * and restoring original local state is INSUFFICIENT because the CZ
+         * edges were consumed.  The correct H·(previous state) requires the
+         * full sum-over-y with the current local state, but without neighbors
+         * (edges gone) this degenerates to standard H on the current local.
+         * For arbitrary local state a', this gives H·a', which is correct for
+         * a 0-edge site — just hpcq_hadamard.  Remove the absorb entry,
+         * apply standard H.  The consumed CZ information is lost. */
+        free(g->absorb[existing_absorb].nbrs);
+        g->absorb[existing_absorb] = g->absorb[--g->n_absorb];
+        hpcq_hadamard(g, site);
+        return;
     }
 
     if (n_inc == 0) {
@@ -311,6 +333,7 @@ static inline void hpcq_hadamard_absorb(HPCQGraph *g, uint64_t site)
 
         for (uint64_t e = 0; e < g->n_edges; e++) {
             HPCQEdge *edge = &g->edges[e];
+            if (edge->type == HPCQ_EDGE_ABSORBED) continue;
             if (edge->site_a == site || edge->site_b == site) {
                 uint64_t p = (edge->site_a == site) ? edge->site_b : edge->site_a;
                 int dup = 0;
