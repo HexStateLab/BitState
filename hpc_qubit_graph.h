@@ -545,17 +545,19 @@ static inline void hpcq_hadamard_absorb(HPCQGraph *g, uint64_t site)
         double uni[2] = {1.0, 1.0}, zero[2] = {0.0, 0.0};
         tri_init_state(&g->locals[site], VIEW_EDGE, uni, zero);
 
-        g->absorb[g->n_absorb].center = site;
-        g->absorb[g->n_absorb].n_nbrs = n_nbrs;
-        g->absorb[g->n_absorb].n_inner = n_nbrs;
-        g->absorb[g->n_absorb].nbrs = nbrs;
-        g->absorb[g->n_absorb].w_re = w_re;
-        g->absorb[g->n_absorb].w_im = w_im;
-        g->absorb[g->n_absorb].a_re[0] = orig_re[0];
-        g->absorb[g->n_absorb].a_re[1] = orig_re[1];
-        g->absorb[g->n_absorb].a_im[0] = orig_im[0];
-        g->absorb[g->n_absorb].a_im[1] = orig_im[1];
-        g->absorb[g->n_absorb].n_layers = 1;
+        uint64_t ai = g->n_absorb;
+        g->absorb[ai].center = site;
+        g->absorb[ai].n_nbrs = n_nbrs;
+        g->absorb[ai].n_inner = n_nbrs;
+        g->absorb[ai].nbrs = nbrs;
+        g->absorb[ai].w_re = w_re;
+        g->absorb[ai].w_im = w_im;
+        g->absorb[ai].a_re[0] = orig_re[0];
+        g->absorb[ai].a_re[1] = orig_re[1];
+        g->absorb[ai].a_im[0] = orig_im[0];
+        g->absorb[ai].a_im[1] = orig_im[1];
+        g->absorb[ai].n_layers = 1;
+        g->absorb_idx[site] = (int64_t)ai;
         g->n_absorb++;
 
         HPCQGateEntry entry = { .type = HPCQ_GATE_LOCAL_H, .site_a = site,
