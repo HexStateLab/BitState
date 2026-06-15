@@ -273,35 +273,87 @@ static inline HPCQSparseVector *hpcq_sparse_tree(const HPCQGraph *g,
         for (uint64_t a = 0; a < g->n_absorb; a++) {
             uint64_t center = g->absorb[a].center;
             int xv = (int)current[b].indices[center];
+            uint64_t n_inner = g->absorb[a].n_inner;
 
-            double prod_re[2] = {1.0, 1.0};
-            double prod_im[2] = {0.0, 0.0};
-            for (uint64_t k = 0; k < g->absorb[a].n_nbrs; k++) {
+            /* Inner product: Π w_k(y, z_k) for y = 0, 1 (k < n_inner) */
+            double pi_re[2] = {1.0, 1.0};
+            double pi_im[2] = {0.0, 0.0};
+            for (uint64_t k = 0; k < n_inner; k++) {
                 int z = (int)current[b].indices[g->absorb[a].nbrs[k]];
                 for (int y = 0; y < 2; y++) {
                     int idx = (int)k * 4 + y * 2 + z;
                     double wr = g->absorb[a].w_re[idx];
                     double wi = g->absorb[a].w_im[idx];
-                    double pr = prod_re[y], pi = prod_im[y];
-                    prod_re[y] = pr * wr - pi * wi;
-                    prod_im[y] = pr * wi + pi * wr;
+                    double pr = pi_re[y], pim = pi_im[y];
+                    pi_re[y] = pr * wr - pim * wi;
+                    pi_im[y] = pr * wi + pim * wr;
                 }
             }
 
-            double sum_re = 0.0, sum_im = 0.0;
-            for (int y = 0; y < 2; y++) {
-                double Hy = (xv == 0) ? SQRT2 : (y == 0 ? SQRT2 : -SQRT2);
-                double ar = g->absorb[a].a_re[y];
-                double ai = g->absorb[a].a_im[y];
-                double pr = prod_re[y], pi = prod_im[y];
-                double hr = Hy * ar, hi = Hy * ai;
-                sum_re += hr * pr - hi * pi;
-                sum_im += hr * pi + hi * pr;
-            }
+            if (g->absorb[a].n_layers >= 2) {
+                /* Outer product: Π w_k(q, z_k) for q = 0, 1 (k >= n_inner) */
+                double po_re[2] = {1.0, 1.0};
+                double po_im[2] = {0.0, 0.0};
+                for (uint64_t k = n_inner; k < g->absorb[a].n_nbrs; k++) {
+                    int z = (int)current[b].indices[g->absorb[a].nbrs[k]];
+                    for (int q = 0; q < 2; q++) {
+                        int idx = (int)k * 4 + q * 2 + z;
+                        double wr = g->absorb[a].w_re[idx];
+                        double wi = g->absorb[a].w_im[idx];
+                        double pr = po_re[q], pim = po_im[q];
+                        po_re[q] = pr * wr - pim * wi;
+                        po_im[q] = pr * wi + pim * wr;
+                    }
+                }
 
-            double tmp_re = re * sum_re - im * sum_im;
-            double tmp_im = re * sum_im + im * sum_re;
-            re = tmp_re; im = tmp_im;
+                /* mid[q] = Σ_y H[q][y] · a_re[y] · pi[y] */
+                double mid_re[2] = {0.0, 0.0}, mid_im[2] = {0.0, 0.0};
+                for (int q = 0; q < 2; q++) {
+                    for (int y = 0; y < 2; y++) {
+                        double Hqy = (q == 0) ? SQRT2 : (y == 0 ? SQRT2 : -SQRT2);
+                        double ar = g->absorb[a].a_re[y];
+                        double ai = g->absorb[a].a_im[y];
+                        double pr = pi_re[y], pim = pi_im[y];
+                        double hr = Hqy * ar, hi = Hqy * ai;
+                        mid_re[q] += hr * pr - hi * pim;
+                        mid_im[q] += hr * pim + hi * pr;
+                    }
+                }
+
+                /* Σ_q H[xv][q] · a_cur(q) · po(q) · mid[q] */
+                double sum_re = 0.0, sum_im = 0.0;
+                for (int q = 0; q < 2; q++) {
+                    double Hxq = (xv == 0) ? SQRT2 : (q == 0 ? SQRT2 : -SQRT2);
+                    double cr = g->absorb[a].a_cur_re[q];
+                    double ci = g->absorb[a].a_cur_im[q];
+                    double por = po_re[q], poi = po_im[q];
+                    double mr = mid_re[q], mi = mid_im[q];
+                    double cpor = cr * por - ci * poi;
+                    double cpoi = cr * poi + ci * por;
+                    double comb_re = cpor * mr - cpoi * mi;
+                    double comb_im = cpor * mi + cpoi * mr;
+                    sum_re += Hxq * comb_re;
+                    sum_im += Hxq * comb_im;
+                }
+                double tmp_re = re * sum_re - im * sum_im;
+                double tmp_im = re * sum_im + im * sum_re;
+                re = tmp_re; im = tmp_im;
+            } else {
+                /* Single-layer: Σ_y H[xv][y] · a_re(y) · pi(y) */
+                double sum_re = 0.0, sum_im = 0.0;
+                for (int y = 0; y < 2; y++) {
+                    double Hy = (xv == 0) ? SQRT2 : (y == 0 ? SQRT2 : -SQRT2);
+                    double ar = g->absorb[a].a_re[y];
+                    double ai = g->absorb[a].a_im[y];
+                    double pr = pi_re[y], pim = pi_im[y];
+                    double hr = Hy * ar, hi = Hy * ai;
+                    sum_re += hr * pr - hi * pim;
+                    sum_im += hr * pim + hi * pr;
+                }
+                double tmp_re = re * sum_re - im * sum_im;
+                double tmp_im = re * sum_im + im * sum_re;
+                re = tmp_re; im = tmp_im;
+            }
         }
         double prob = re * re + im * im;
         if (prob >= threshold)

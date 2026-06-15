@@ -101,20 +101,35 @@ typedef struct {
 } HPCQGateEntry;
 
 /* Absorb entry: site whose H gate was absorbed with >1 incident edges.
- * For each neighbor k, w_re[k*4 + y*2 + z_k] and w_im[k*4 + y*2 + z_k]
- * store the 2×2 edge matrix in y-z form (y = pre-H site index).
- *   ψ_v(x_v, z_1..z_m) = Σ_y H_{x_v,y} · a_original(y) · Π_k w_k(y, z_k)
- * The local state a'_v (set to uniform (1,1)) is multiplied by
- * any post-absorption diagonal gates.
- * At evaluation: total = a'_v(x_v) × ψ_v(x_v, z_1..z_m). */
+ * Each neighbor k stores a 2×2 edge matrix in y-z form:
+ *   w_re[k*4 + y*2 + z_k], w_im[k*4 + y*2 + z_k]
+ * where y is the pre-H (summed-over) index of the center site.
+ *
+ * Single-layer (n_layers=1):
+ *   ψ_v(x_v, zs) = Σ_y H_{x_v,y} · a_re(y) · Π_{k} w_k(y, z_k)
+ * with all neighbors in the "inner" group (k < n_inner).
+ *
+ * Two-layer (n_layers=2): re-absorption — H applied again on an
+ * already-absorbed site.  Edges from the FIRST absorption remain
+ * in the inner group; edges added AFTER that go to the outer group
+ * (k >= n_inner).  The evaluation uses two nested sums:
+ *   ψ_v(x_v, zs) = Σ_q H[x_v][q] · a_cur(q) · Π_{outer} w_k(q, z_k)
+ *                   · Σ_y  H[q][y]  · a_re(y)   · Π_{inner} w_k(y, z_k)
+ * This correctly handles new CZ edges (which use the outer variable q)
+ * alongside the original absorbed edges (which use the inner variable y).
+ * Diagonal gates (T, S) between the two H operations modify a_cur. */
 typedef struct {
     uint64_t  center;
     uint64_t  n_nbrs;
+    uint64_t  n_inner;   /* first n_inner neighbors are inner group */
     uint64_t *nbrs;
-    double   *w_re;       /* [n_nbrs * 4] — 2×2 per neighbor, y-z form */
+    double   *w_re;       /* [n_nbrs * 4] — inner then outer */
     double   *w_im;
-    double    a_re[2];    /* Z-basis amplitude at absorption time */
+    double    a_re[2];    /* Z-basis amplitude at FIRST absorption time */
     double    a_im[2];
+    int       n_layers;   /* 1 or 2 */
+    double    a_cur_re[2];/* pre-H local state for second layer */
+    double    a_cur_im[2];
 } HPCQAbsorbEntry;
 
 /* ═══════════════════════════════════════════════════════════════════════════════
@@ -269,23 +284,26 @@ static inline void hpcq_hadamard(HPCQGraph *g, uint64_t site)
 }
 
 /* ──────────────────────────────────────────────────────────────────────────────
- * hpcq_hadamard_absorb — H gate that correctly handles post-CZ qubits.
+ * hpcq_hadamard_absorb — H gate on a site with incident phase edges.
  *
  * Standard hpcq_hadamard only modifies the local Z-basis amplitude, which
- * gives WRONG results for qubits with incident CZ edges (the edge phase
- * (-1)^{x_k·x_j} must be evaluated under the sum over y created by H).
+ * gives WRONG results for qubits with incident CZ/PHASE edges (the edge
+ * phase must be evaluated under the sum over y created by H).
  *
- * This function absorbs the H gate into the edge matrix:
- *   w'(x_k, x_j) = Σ_y H_{x_k,y} · a_k(y) · w_old(y, x_j)
- *   a_k ← (1, 1)   (uniform representer — qubit is "consumed")
- *
- * CRITICAL: after absorption, all further non-diagonal gates on this site
- * must ALSO be absorbed (re-absorption: edge' ← H × edge).  Diagonal gates
- * (Z, S, T, phase) work directly on the local state without re-absorption.
- *
- * LIMITATION: sites with >1 incident edges cannot be handled — the sum
- * over y couples all neighbors through their collective parity, creating
- * an (m+1)-tensor that cannot be factorized into pairwise edges.
+ * Cases:
+ *   0 incident edges → standard hpcq_hadamard (no sum needed).
+ *   1 incident edge → absorb into edge matrix (single-edge absorption):
+ *        w'(x_k, x_j) = Σ_y H_{x_k,y} · a_k(y) · w_old(y, x_j)
+ *   >1 incident edges → multi-edge absorption:
+ *        stores edge matrices in absorb entry, evaluated as
+ *        ψ_v(x_v, zs) = Σ_y H_{x_v,y} · a_orig(y) · Π_k w_k(y, z_k)
+ * Existing absorb entry → re-absorption (H applied again):
+ *        old edges stay in inner group (variable y), new incident
+ *        edges go to outer group (variable q).  Two-layer evaluation:
+ *        ψ_v(x_v) = Σ_q H[x_v][q] · a_cur(q) · Π_outer w_k(q, z_k)
+ *                  · Σ_y  H[q][y]  · a_re(y)   · Π_inner w_k(y, z_k)
+ * Diagonal gates (Z, S, T) between H operations modify a_cur.
+ * Local state becomes uniform representer (1,1) after absorption.
  * ────────────────────────────────────────────────────────────────────────────── */
 static inline void hpcq_hadamard_absorb(HPCQGraph *g, uint64_t site)
 {
@@ -310,14 +328,114 @@ static inline void hpcq_hadamard_absorb(HPCQGraph *g, uint64_t site)
         if (g->absorb[a].center == site) { existing_absorb = (int)a; break; }
     }
 
-    /* Remove any existing absorb entry for this site — stale edges */
+    /* ─── Re-absorption: H gate applied again on an already-absorbed site ─── */
     if (existing_absorb >= 0) {
-        free(g->absorb[existing_absorb].nbrs);
-        free(g->absorb[existing_absorb].w_re);
-        free(g->absorb[existing_absorb].w_im);
-        g->absorb[existing_absorb] = g->absorb[--g->n_absorb];
+        HPCQAbsorbEntry *old = &g->absorb[existing_absorb];
+        double cur_re[2], cur_im[2];
+        tri_get_amplitudes(&g->locals[site], VIEW_EDGE, cur_re, cur_im);
+
+        if (n_inc == 0) {
+            /* No new edges: just record the second H layer */
+            old->n_layers = 2;
+            old->a_cur_re[0] = cur_re[0];
+            old->a_cur_re[1] = cur_re[1];
+            old->a_cur_im[0] = cur_im[0];
+            old->a_cur_im[1] = cur_im[1];
+            double uni[2] = {1.0, 1.0}, zero[2] = {0.0, 0.0};
+            tri_init_state(&g->locals[site], VIEW_EDGE, uni, zero);
+            HPCQGateEntry entry = { .type = HPCQ_GATE_LOCAL_H, .site_a = site,
+                                    .fidelity = 1.0 };
+            hpcq_log_gate(g, entry);
+            return;
+        }
+
+        /* Merge: old edges stay inner, new edges go to outer group.
+         * Dedup only within the outer group (same outer variable q).
+         * Duplicates across inner/outer are correct — different variables. */
+        uint64_t inner_start = old->n_inner;
+        for (uint64_t e = 0; e < g->n_edges; e++) {
+            HPCQEdge *edge = &g->edges[e];
+            if (edge->type == HPCQ_EDGE_ABSORBED) continue;
+            if (edge->site_a == site || edge->site_b == site) n_inc++;
+        }
+        uint64_t total_max = old->n_nbrs + (uint64_t)n_inc;
+        uint64_t *new_nbrs = (uint64_t *)calloc(total_max, sizeof(uint64_t));
+        double *new_w_re = (double *)calloc(total_max * 4, sizeof(double));
+        double *new_w_im = (double *)calloc(total_max * 4, sizeof(double));
+        uint64_t n_nbrs = old->n_nbrs;
+
+        memcpy(new_nbrs, old->nbrs, old->n_nbrs * sizeof(uint64_t));
+        memcpy(new_w_re, old->w_re, old->n_nbrs * 4 * sizeof(double));
+        memcpy(new_w_im, old->w_im, old->n_nbrs * 4 * sizeof(double));
+
+        for (uint64_t e = 0; e < g->n_edges; e++) {
+            HPCQEdge *edge = &g->edges[e];
+            if (edge->type == HPCQ_EDGE_ABSORBED) continue;
+            if (edge->site_a == site || edge->site_b == site) {
+                uint64_t p = (edge->site_a == site) ? edge->site_b : edge->site_a;
+                double e_re[2][2], e_im[2][2];
+                if (edge->type == HPCQ_EDGE_CZ) {
+                    for (int q = 0; q < 2; q++)
+                        for (int z = 0; z < 2; z++) {
+                            e_re[q][z] = ((q * z) % 2 == 0) ? 1.0 : -1.0;
+                            e_im[q][z] = 0.0;
+                        }
+                } else {
+                    for (int q = 0; q < 2; q++)
+                        for (int z = 0; z < 2; z++) {
+                            e_re[q][z] = edge->w_re[q][z];
+                            e_im[q][z] = edge->w_im[q][z];
+                        }
+                }
+                /* Dedup only against outer group (uses same variable q) */
+                int found = -1;
+                for (uint64_t k = inner_start; k < n_nbrs; k++)
+                    if (new_nbrs[k] == p) { found = (int)k; break; }
+                if (found >= 0) {
+                    for (int q = 0; q < 2; q++)
+                        for (int z = 0; z < 2; z++) {
+                            int idx = found * 4 + q * 2 + z;
+                            double wr = new_w_re[idx], wi = new_w_im[idx];
+                            new_w_re[idx] = wr * e_re[q][z] - wi * e_im[q][z];
+                            new_w_im[idx] = wr * e_im[q][z] + wi * e_re[q][z];
+                        }
+                } else {
+                    new_nbrs[n_nbrs] = p;
+                    for (int q = 0; q < 2; q++)
+                        for (int z = 0; z < 2; z++) {
+                            int idx = n_nbrs * 4 + q * 2 + z;
+                            new_w_re[idx] = e_re[q][z];
+                            new_w_im[idx] = e_im[q][z];
+                        }
+                    n_nbrs++;
+                }
+                edge->type = HPCQ_EDGE_ABSORBED;
+            }
+        }
+
+        free(old->nbrs);
+        free(old->w_re);
+        free(old->w_im);
+        old->n_nbrs = n_nbrs;
+        old->n_inner = old->n_inner;  /* preserved */
+        old->nbrs = new_nbrs;
+        old->w_re = new_w_re;
+        old->w_im = new_w_im;
+        old->n_layers = 2;
+        old->a_cur_re[0] = cur_re[0];
+        old->a_cur_re[1] = cur_re[1];
+        old->a_cur_im[0] = cur_im[0];
+        old->a_cur_im[1] = cur_im[1];
+
+        double uni[2] = {1.0, 1.0}, zero[2] = {0.0, 0.0};
+        tri_init_state(&g->locals[site], VIEW_EDGE, uni, zero);
+        HPCQGateEntry entry = { .type = HPCQ_GATE_LOCAL_H, .site_a = site,
+                                .fidelity = 1.0 };
+        hpcq_log_gate(g, entry);
+        return;
     }
 
+    /* ─── First-time absorption (no prior absorb entry) ─── */
     if (n_inc == 0) {
         hpcq_hadamard(g, site);
         return;
@@ -349,7 +467,6 @@ static inline void hpcq_hadamard_absorb(HPCQGraph *g, uint64_t site)
                             e_im[y][z] = 0.0;
                         }
                 } else {
-                    /* PHASE: use stored matrix — first index IS the y-sum index */
                     for (int y = 0; y < 2; y++)
                         for (int z = 0; z < 2; z++) {
                             e_re[y][z] = edge->w_re[y][z];
@@ -357,7 +474,6 @@ static inline void hpcq_hadamard_absorb(HPCQGraph *g, uint64_t site)
                         }
                 }
 
-                /* Check for duplicate neighbor — multiply matrices */
                 int found = -1;
                 for (uint64_t k = 0; k < n_nbrs; k++)
                     if (nbrs[k] == p) { found = (int)k; break; }
@@ -392,7 +508,6 @@ static inline void hpcq_hadamard_absorb(HPCQGraph *g, uint64_t site)
                         g->absorb_cap * sizeof(HPCQAbsorbEntry));
         }
 
-        /* Save original local amplitudes, then set uniform representer */
         double orig_re[2], orig_im[2];
         tri_get_amplitudes(&g->locals[site], VIEW_EDGE, orig_re, orig_im);
         double uni[2] = {1.0, 1.0}, zero[2] = {0.0, 0.0};
@@ -400,6 +515,7 @@ static inline void hpcq_hadamard_absorb(HPCQGraph *g, uint64_t site)
 
         g->absorb[g->n_absorb].center = site;
         g->absorb[g->n_absorb].n_nbrs = n_nbrs;
+        g->absorb[g->n_absorb].n_inner = n_nbrs;
         g->absorb[g->n_absorb].nbrs = nbrs;
         g->absorb[g->n_absorb].w_re = w_re;
         g->absorb[g->n_absorb].w_im = w_im;
@@ -407,6 +523,7 @@ static inline void hpcq_hadamard_absorb(HPCQGraph *g, uint64_t site)
         g->absorb[g->n_absorb].a_re[1] = orig_re[1];
         g->absorb[g->n_absorb].a_im[0] = orig_im[0];
         g->absorb[g->n_absorb].a_im[1] = orig_im[1];
+        g->absorb[g->n_absorb].n_layers = 1;
         g->n_absorb++;
 
         HPCQGateEntry entry = { .type = HPCQ_GATE_LOCAL_H, .site_a = site,
@@ -415,16 +532,14 @@ static inline void hpcq_hadamard_absorb(HPCQGraph *g, uint64_t site)
         return;
     }
 
-    /* Get local Z-basis amplitude at the site (pre-absorption) */
+    /* Single-edge absorption (first time, exactly 1 incident edge) */
     double a_re[2], a_im[2];
     tri_get_amplitudes(&g->locals[site], VIEW_EDGE, a_re, a_im);
 
     HPCQEdge *edge = &g->edges[e_idx];
     uint64_t partner = (edge->site_a == site) ? edge->site_b : edge->site_a;
 
-    /* Compute w'(x_k, x_j) = Σ_y H_{x_k,y} · a_k(y) · w_old(y, x_j) */
     double wr[2][2] = {{0}}, wi[2][2] = {{0}};
-
     for (int xk = 0; xk < 2; xk++) {
         for (int xj = 0; xj < 2; xj++) {
             double sum_re = 0.0, sum_im = 0.0;
@@ -449,17 +564,14 @@ static inline void hpcq_hadamard_absorb(HPCQGraph *g, uint64_t site)
         }
     }
 
-    /* Set local state to uniform representer (1, 1) */
     double uni[2] = {1.0, 1.0}, zero[2] = {0.0, 0.0};
     tri_init_state(&g->locals[site], VIEW_EDGE, uni, zero);
 
-    /* Replace the edge with the merged general edge */
     edge->type = HPCQ_EDGE_PHASE;
     edge->fidelity = 1.0;
     memcpy(edge->w_re, wr, sizeof(wr));
     memcpy(edge->w_im, wi, sizeof(wi));
 
-    /* Log */
     HPCQGateEntry entry = { .type = HPCQ_GATE_LOCAL_H, .site_a = site,
                             .fidelity = 1.0 };
     hpcq_log_gate(g, entry);
@@ -683,39 +795,89 @@ static inline void hpcq_amplitude(const HPCQGraph *g,
     for (uint64_t a = 0; a < g->n_absorb; a++) {
         uint64_t center = g->absorb[a].center;
         int xv = (int)indices[center];
+        uint64_t n_inner = g->absorb[a].n_inner;
 
-        /* Compute Π_k w_k(y, z_k) for y = 0, 1 */
-        double prod_re[2] = {1.0, 1.0};
-        double prod_im[2] = {0.0, 0.0};
-        for (uint64_t k = 0; k < g->absorb[a].n_nbrs; k++) {
+        /* Inner product: Π w_k(y, z_k) for y = 0, 1 (k < n_inner) */
+        double pi_re[2] = {1.0, 1.0};
+        double pi_im[2] = {0.0, 0.0};
+        for (uint64_t k = 0; k < n_inner; k++) {
             int z = (int)indices[g->absorb[a].nbrs[k]];
             for (int y = 0; y < 2; y++) {
                 int idx = (int)k * 4 + y * 2 + z;
                 double wr = g->absorb[a].w_re[idx];
                 double wi = g->absorb[a].w_im[idx];
-                double pr = prod_re[y], pi = prod_im[y];
-                prod_re[y] = pr * wr - pi * wi;
-                prod_im[y] = pr * wi + pi * wr;
+                double pr = pi_re[y], pim = pi_im[y];
+                pi_re[y] = pr * wr - pim * wi;
+                pi_im[y] = pr * wi + pim * wr;
             }
         }
 
-        /* Σ_y H_{xv,y} · a_original(y) · prod_k(y) */
-        double sum_re = 0.0, sum_im = 0.0;
-        for (int y = 0; y < 2; y++) {
-            double Hy = (xv == 0) ? SQ : (y == 0 ? SQ : -SQ);
-            double ar = g->absorb[a].a_re[y];
-            double ai = g->absorb[a].a_im[y];
-            double pr = prod_re[y], pi = prod_im[y];
-            double h_re = Hy * ar - 0.0 * ai;
-            double h_im = Hy * ai + 0.0 * ar;
-            sum_re += h_re * pr - h_im * pi;
-            sum_im += h_re * pi + h_im * pr;
-        }
+        if (g->absorb[a].n_layers >= 2) {
+            /* Outer product: Π w_k(q, z_k) for q = 0, 1 (k >= n_inner) */
+            double po_re[2] = {1.0, 1.0};
+            double po_im[2] = {0.0, 0.0};
+            for (uint64_t k = n_inner; k < g->absorb[a].n_nbrs; k++) {
+                int z = (int)indices[g->absorb[a].nbrs[k]];
+                for (int q = 0; q < 2; q++) {
+                    int idx = (int)k * 4 + q * 2 + z;
+                    double wr = g->absorb[a].w_re[idx];
+                    double wi = g->absorb[a].w_im[idx];
+                    double pr = po_re[q], pim = po_im[q];
+                    po_re[q] = pr * wr - pim * wi;
+                    po_im[q] = pr * wi + pim * wr;
+                }
+            }
 
-        double new_re = re * sum_re - im * sum_im;
-        double new_im = re * sum_im + im * sum_re;
-        re = new_re;
-        im = new_im;
+            /* mid[q] = Σ_y H[q][y] · a_re[y] · pi[y] */
+            double mid_re[2] = {0.0, 0.0}, mid_im[2] = {0.0, 0.0};
+            for (int q = 0; q < 2; q++) {
+                for (int y = 0; y < 2; y++) {
+                    double Hqy = (q == 0) ? SQ : (y == 0 ? SQ : -SQ);
+                    double ar = g->absorb[a].a_re[y];
+                    double ai = g->absorb[a].a_im[y];
+                    double pr = pi_re[y], pim = pi_im[y];
+                    double hr = Hqy * ar, hi = Hqy * ai;
+                    mid_re[q] += hr * pr - hi * pim;
+                    mid_im[q] += hr * pim + hi * pr;
+                }
+            }
+
+            /* Σ_q H[xv][q] · a_cur(q) · po(q) · mid[q] */
+            double sum_re = 0.0, sum_im = 0.0;
+            for (int q = 0; q < 2; q++) {
+                double Hxq = (xv == 0) ? SQ : (q == 0 ? SQ : -SQ);
+                double cr = g->absorb[a].a_cur_re[q];
+                double ci = g->absorb[a].a_cur_im[q];
+                double por = po_re[q], poi = po_im[q];
+                double mr = mid_re[q], mi = mid_im[q];
+                double cpor = cr * por - ci * poi;
+                double cpoi = cr * poi + ci * por;
+                double comb_re = cpor * mr - cpoi * mi;
+                double comb_im = cpor * mi + cpoi * mr;
+                sum_re += Hxq * comb_re;
+                sum_im += Hxq * comb_im;
+            }
+            double new_re = re * sum_re - im * sum_im;
+            double new_im = re * sum_im + im * sum_re;
+            re = new_re;
+            im = new_im;
+        } else {
+            /* Single-layer: Σ_y H_{xv,y} · a_re(y) · pi(y) */
+            double sum_re = 0.0, sum_im = 0.0;
+            for (int y = 0; y < 2; y++) {
+                double Hy = (xv == 0) ? SQ : (y == 0 ? SQ : -SQ);
+                double ar = g->absorb[a].a_re[y];
+                double ai = g->absorb[a].a_im[y];
+                double pr = pi_re[y], pim = pi_im[y];
+                double hr = Hy * ar, hi = Hy * ai;
+                sum_re += hr * pr - hi * pim;
+                sum_im += hr * pim + hi * pr;
+            }
+            double new_re = re * sum_re - im * sum_im;
+            double new_im = re * sum_im + im * sum_re;
+            re = new_re;
+            im = new_im;
+        }
     }
 
     *out_re = re;
