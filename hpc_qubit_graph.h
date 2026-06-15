@@ -673,8 +673,10 @@ static inline void hpcq_x(HPCQGraph *g, uint64_t site)
 
 static inline void hpcq_cz(HPCQGraph *g, uint64_t site_a, uint64_t site_b)
 {
-    /* Check for existing CZ edge between this pair — CZ² = I cancellation */
-    for (uint64_t e = 0; e < g->n_edges; e++) {
+    /* Check for existing CZ edge between this pair — CZ² = I cancellation
+     * Uses incident edge list of site_a for O(deg) lookup instead of O(E). */
+    for (uint64_t ii = 0; ii < g->inc_counts[site_a]; ii++) {
+        uint64_t e = g->inc_edges[site_a][ii];
         HPCQEdge *edge = &g->edges[e];
         if (edge->type == HPCQ_EDGE_CZ &&
             ((edge->site_a == site_a && edge->site_b == site_b) ||
