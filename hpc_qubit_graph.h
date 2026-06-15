@@ -100,12 +100,18 @@ typedef struct {
 } HPCQGateEntry;
 
 /* Absorb entry: site whose H gate was absorbed with >1 incident CZ edges.
- * The δ(z_center, parity) constraint is checked in hpcq_amplitude.
- * nbrs is a flat array: [nbr_0...nbr_{n-1}] */
+ * The amplitude contribution for this site is:
+ *   ψ_v(x_v, x_N) = Σ_y H_{x_v,y} · a_original(y) · (-1)^{y · parity(N)}
+ * where a_original(y) is the Z-basis amplitude at absorption time.
+ * The local state a'_v (set to uniform (1,1))
+ * is then multiplied by any post-absorption diagonal gates (T, S, Z).
+ * At evaluation: total = a'_v(x_v) × ψ_v(x_v, parity). */
 typedef struct {
     uint64_t  center;
     uint64_t  n_nbrs;
     uint64_t *nbrs;
+    double    a_re[2];   /* Z-basis amplitude at absorption time */
+    double    a_im[2];
 } HPCQAbsorbEntry;
 
 /* ═══════════════════════════════════════════════════════════════════════════════
@@ -322,14 +328,20 @@ static inline void hpcq_hadamard_absorb(HPCQGraph *g, uint64_t site)
                         g->absorb_cap * sizeof(HPCQAbsorbEntry));
         }
 
+        /* Save original local amplitudes, then set uniform representer */
+        double orig_re[2], orig_im[2];
+        tri_get_amplitudes(&g->locals[site], VIEW_EDGE, orig_re, orig_im);
+        double uni[2] = {1.0, 1.0}, zero[2] = {0.0, 0.0};
+        tri_init_state(&g->locals[site], VIEW_EDGE, uni, zero);
+
         g->absorb[g->n_absorb].center = site;
         g->absorb[g->n_absorb].n_nbrs = n_nbrs;
         g->absorb[g->n_absorb].nbrs = nbrs;
+        g->absorb[g->n_absorb].a_re[0] = orig_re[0];
+        g->absorb[g->n_absorb].a_re[1] = orig_re[1];
+        g->absorb[g->n_absorb].a_im[0] = orig_im[0];
+        g->absorb[g->n_absorb].a_im[1] = orig_im[1];
         g->n_absorb++;
-
-        /* Uniform representer */
-        double uni[2] = {1.0, 1.0}, zero[2] = {0.0, 0.0};
-        tri_init_state(&g->locals[site], VIEW_EDGE, uni, zero);
 
         HPCQGateEntry entry = { .type = HPCQ_GATE_LOCAL_H, .site_a = site,
                                 .fidelity = 1.0 };
@@ -610,15 +622,32 @@ static inline void hpcq_amplitude(const HPCQGraph *g,
         im = new_im;
     }
 
-    /* Step 3: Multi-edge absorb parity check — O(n_absorb × degree)
-     * δ(z_center, Σ z_nbr mod 2): zero amplitude on violation */
+    /* Step 3: Multi-edge absorb correction
+     * For each absorbed center: multiply by
+     *   ψ_v(x_v, parity) = Σ_y H_{x_v,y} · a_original(y) · (-1)^{y·parity}
+     * where a_original(y) is the saved pre-absorption amplitude.
+     * The local state already contributes a'_v(x_v) (uniform or post-absorb gate).
+     * Total center factor = a'_v(x_v) × ψ_v(x_v, parity). */
+    static const double SQ = 0.7071067811865475244;
     for (uint64_t a = 0; a < g->n_absorb; a++) {
+        uint64_t center = g->absorb[a].center;
         uint64_t parity = 0;
         for (uint64_t k = 0; k < g->absorb[a].n_nbrs; k++)
             parity ^= indices[g->absorb[a].nbrs[k]];
-        if (indices[g->absorb[a].center] != parity) {
-            re = 0.0; im = 0.0; break;
+        int xv = (int)indices[center];
+        double sum_re = 0.0, sum_im = 0.0;
+        for (int y = 0; y < 2; y++) {
+            double H_re = (xv == 0) ? SQ : (y == 0 ? SQ : -SQ);
+            double phase = (y == 0 || parity == 0) ? 1.0 : -1.0;
+            double ha_re = H_re * g->absorb[a].a_re[y];
+            double ha_im = H_re * g->absorb[a].a_im[y];
+            sum_re += ha_re * phase;
+            sum_im += ha_im * phase;
         }
+        double new_re = re * sum_re - im * sum_im;
+        double new_im = re * sum_im + im * sum_re;
+        re = new_re;
+        im = new_im;
     }
 
     *out_re = re;

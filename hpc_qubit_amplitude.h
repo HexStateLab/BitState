@@ -266,22 +266,30 @@ static inline HPCQSparseVector *hpcq_sparse_tree(const HPCQGraph *g,
         }
     }
 
-    /* Collect results — filter by absorb parity constraint */
+    /* Collect results — apply absorb correction, then filter by threshold */
+    static const double SQRT2 = 0.7071067811865475244;
     for (uint64_t b = 0; b < n_current; b++) {
-        int absorb_ok = 1;
-        for (uint64_t a = 0; a < g->n_absorb && absorb_ok; a++) {
+        double re = current[b].re, im = current[b].im;
+        for (uint64_t a = 0; a < g->n_absorb; a++) {
+            uint64_t center = g->absorb[a].center;
             uint64_t parity = 0;
             for (uint64_t k = 0; k < g->absorb[a].n_nbrs; k++)
                 parity ^= current[b].indices[g->absorb[a].nbrs[k]];
-            if (current[b].indices[g->absorb[a].center] != parity)
-                absorb_ok = 0;
+            int xv = (int)current[b].indices[center];
+            double sum_re = 0, sum_im = 0;
+            for (int y = 0; y < 2; y++) {
+                double H_re = (xv == 0) ? SQRT2 : (y == 0 ? SQRT2 : -SQRT2);
+                double phase = (y == 0 || parity == 0) ? 1.0 : -1.0;
+                sum_re += H_re * g->absorb[a].a_re[y] * phase;
+                sum_im += H_re * g->absorb[a].a_im[y] * phase;
+            }
+            double tmp_re = re * sum_re - im * sum_im;
+            double tmp_im = re * sum_im + im * sum_re;
+            re = tmp_re; im = tmp_im;
         }
-        if (!absorb_ok) continue;
-
-        double prob = current[b].re * current[b].re +
-                      current[b].im * current[b].im;
+        double prob = re * re + im * im;
         if (prob >= threshold)
-            hpcq_sv_add(sv, current[b].indices, current[b].re, current[b].im);
+            hpcq_sv_add(sv, current[b].indices, re, im);
     }
 
     for (uint64_t i = 0; i < pool_cap; i++) {
