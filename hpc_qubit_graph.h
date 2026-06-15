@@ -163,6 +163,9 @@ typedef struct {
     uint64_t       *inc_cap;         /* [n_sites] capacity */
     uint64_t      **inc_edges;       /* [n_sites] arrays of edge indices */
 
+    /* Per-site absorb entry index (-1 = none) */
+    int64_t        *absorb_idx;      /* [n_sites] index into absorb[], or -1 */
+
     /* Statistics */
     uint64_t        amp_evals;
     uint64_t        prob_evals;
@@ -208,8 +211,10 @@ static inline HPCQGraph *hpcq_create(uint64_t n_sites)
     g->inc_counts = (uint64_t *)calloc(n_sites, sizeof(uint64_t));
     g->inc_cap = (uint64_t *)calloc(n_sites, sizeof(uint64_t));
     g->inc_edges = (uint64_t **)calloc(n_sites, sizeof(uint64_t *));
-    if (!g->inc_counts || !g->inc_cap || !g->inc_edges)
+    g->absorb_idx = (int64_t *)malloc(n_sites * sizeof(int64_t));
+    if (!g->inc_counts || !g->inc_cap || !g->inc_edges || !g->absorb_idx)
         { hpcq_destroy(g); return NULL; }
+    for (uint64_t i = 0; i < n_sites; i++) g->absorb_idx[i] = -1;
 
     g->min_fidelity = 1.0;
     g->avg_fidelity = 1.0;
@@ -233,6 +238,7 @@ static inline void hpcq_destroy(HPCQGraph *g)
         for (uint64_t i = 0; i < g->n_sites; i++) free(g->inc_edges[i]);
         free(g->inc_edges);
     }
+    free(g->absorb_idx);
     free(g->inc_cap);
     free(g->inc_counts);
     free(g);
@@ -352,11 +358,8 @@ static inline void hpcq_hadamard_absorb(HPCQGraph *g, uint64_t site)
 
     int n_inc = (int)g->inc_counts[site];
 
-    /* Check if this site already has an absorb entry (re-apply H) */
-    int existing_absorb = -1;
-    for (uint64_t a = 0; a < g->n_absorb; a++) {
-        if (g->absorb[a].center == site) { existing_absorb = (int)a; break; }
-    }
+    /* Check if this site already has an absorb entry (re-apply H) — O(1) via index */
+    int existing_absorb = (int)g->absorb_idx[site];
 
     /* ─── Re-absorption: H gate applied again on an already-absorbed site ─── */
     if (existing_absorb >= 0) {
