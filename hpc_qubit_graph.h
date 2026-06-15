@@ -407,8 +407,13 @@ static inline void hpcq_hadamard_absorb(HPCQGraph *g, uint64_t site)
             } else {
                 for (int q = 0; q < 2; q++)
                     for (int z = 0; z < 2; z++) {
-                        e_re[q][z] = edge->w_re[q][z];
-                        e_im[q][z] = edge->w_im[q][z];
+                        if (edge->site_a == site) {
+                            e_re[q][z] = edge->w_re[q][z];
+                            e_im[q][z] = edge->w_im[q][z];
+                        } else {
+                            e_re[q][z] = edge->w_re[z][q];
+                            e_im[q][z] = edge->w_im[z][q];
+                        }
                     }
             }
             /* Dedup only against outer group (uses same variable q) */
@@ -487,8 +492,13 @@ static inline void hpcq_hadamard_absorb(HPCQGraph *g, uint64_t site)
             } else {
                 for (int y = 0; y < 2; y++)
                     for (int z = 0; z < 2; z++) {
-                        e_re[y][z] = edge->w_re[y][z];
-                        e_im[y][z] = edge->w_im[y][z];
+                        if (edge->site_a == site) {
+                            e_re[y][z] = edge->w_re[y][z];
+                            e_im[y][z] = edge->w_im[y][z];
+                        } else {
+                            e_re[y][z] = edge->w_re[z][y];
+                            e_im[y][z] = edge->w_im[z][y];
+                        }
                     }
             }
 
@@ -573,8 +583,18 @@ static inline void hpcq_hadamard_absorb(HPCQGraph *g, uint64_t site)
                     w_re_yj = (pi == 0) ? 1.0 : -1.0;
                     w_im_yj = 0.0;
                 } else {
-                    w_re_yj = edge->w_re[y][xj];
-                    w_im_yj = edge->w_im[y][xj];
+                    /* Edge stores w[site_a_val][site_b_val].
+                     * We need w(absorbing_preH_val, partner_val).
+                     * When site_a is absorbing: y = absorbing_preH, xj = partner → w_re[y][xj] ✓
+                     * When site_b is absorbing: y = absorbing_preH, xj = partner but
+                     *   w_re is w[site_a=partner][site_b=absorbing] → transpose: w_re[xj][y] */
+                    if (edge->site_a == site) {
+                        w_re_yj = edge->w_re[y][xj];
+                        w_im_yj = edge->w_im[y][xj];
+                    } else {
+                        w_re_yj = edge->w_re[xj][y];
+                        w_im_yj = edge->w_im[xj][y];
+                    }
                 }
                 sum_re += ha_re * w_re_yj - ha_im * w_im_yj;
                 sum_im += ha_re * w_im_yj + ha_im * w_re_yj;
@@ -587,10 +607,22 @@ static inline void hpcq_hadamard_absorb(HPCQGraph *g, uint64_t site)
     double uni[2] = {1.0, 1.0}, zero[2] = {0.0, 0.0};
     tri_init_state(&g->locals[site], VIEW_EDGE, uni, zero);
 
+    /* Store wr at edge->w_re[site_a_val][site_b_val].
+     * wr[xk][xj] where xk = absorbing_postH_val, xj = partner_val.
+     * When site_a is absorbing: w_re[xk][xj] = wr[xk][xj] ✓ (xk=site_a, xj=site_b)
+     * When site_b is absorbing: w_re[xj][xk] = wr[xk][xj] (xj=site_a, xk=site_b) */
     edge->type = HPCQ_EDGE_PHASE;
     edge->fidelity = 1.0;
-    memcpy(edge->w_re, wr, sizeof(wr));
-    memcpy(edge->w_im, wi, sizeof(wi));
+    if (edge->site_a == site) {
+        memcpy(edge->w_re, wr, sizeof(wr));
+        memcpy(edge->w_im, wi, sizeof(wi));
+    } else {
+        for (int i = 0; i < 2; i++)
+            for (int j = 0; j < 2; j++) {
+                edge->w_re[j][i] = wr[i][j];
+                edge->w_im[j][i] = wi[i][j];
+            }
+    }
 
     HPCQGateEntry entry = { .type = HPCQ_GATE_LOCAL_H, .site_a = site,
                             .fidelity = 1.0 };
