@@ -158,6 +158,11 @@ typedef struct {
     uint64_t        log_cap;
     HPCQGateEntry  *gate_log;
 
+    /* Per-site incident edge lists (for O(1) lookup in hadamard_absorb) */
+    uint64_t       *inc_counts;      /* [n_sites] count of incident non-absorbed edges */
+    uint64_t       *inc_cap;         /* [n_sites] capacity */
+    uint64_t      **inc_edges;       /* [n_sites] arrays of edge indices */
+
     /* Statistics */
     uint64_t        amp_evals;
     uint64_t        prob_evals;
@@ -172,6 +177,8 @@ typedef struct {
 /* ═══════════════════════════════════════════════════════════════════════════════
  * LIFECYCLE
  * ═══════════════════════════════════════════════════════════════════════════════ */
+
+static inline void hpcq_destroy(HPCQGraph *g); /* forward decl for create */
 
 static inline HPCQGraph *hpcq_create(uint64_t n_sites)
 {
@@ -198,6 +205,12 @@ static inline HPCQGraph *hpcq_create(uint64_t n_sites)
     g->gate_log = (HPCQGateEntry *)calloc(g->log_cap, sizeof(HPCQGateEntry));
     g->n_log = 0;
 
+    g->inc_counts = (uint64_t *)calloc(n_sites, sizeof(uint64_t));
+    g->inc_cap = (uint64_t *)calloc(n_sites, sizeof(uint64_t));
+    g->inc_edges = (uint64_t **)calloc(n_sites, sizeof(uint64_t *));
+    if (!g->inc_counts || !g->inc_cap || !g->inc_edges)
+        { hpcq_destroy(g); return NULL; }
+
     g->min_fidelity = 1.0;
     g->avg_fidelity = 1.0;
 
@@ -216,6 +229,12 @@ static inline void hpcq_destroy(HPCQGraph *g)
     free(g->locals);
     free(g->edges);
     free(g->gate_log);
+    if (g->inc_edges) {
+        for (uint64_t i = 0; i < g->n_sites; i++) free(g->inc_edges[i]);
+        free(g->inc_edges);
+    }
+    free(g->inc_cap);
+    free(g->inc_counts);
     free(g);
 }
 
@@ -242,6 +261,28 @@ static inline void hpcq_log_gate(HPCQGraph *g, HPCQGateEntry entry)
 {
     hpcq_grow_log(g);
     g->gate_log[g->n_log++] = entry;
+}
+
+/* ── Incident edge list management ── */
+static inline void hpcq_inc_add(HPCQGraph *g, uint64_t site, uint64_t edge_idx)
+{
+    if (g->inc_counts[site] >= g->inc_cap[site]) {
+        uint64_t new_cap = g->inc_cap[site] ? g->inc_cap[site] * 2 : 4;
+        g->inc_edges[site] = (uint64_t *)realloc(g->inc_edges[site],
+                                                    new_cap * sizeof(uint64_t));
+        g->inc_cap[site] = new_cap;
+    }
+    g->inc_edges[site][g->inc_counts[site]++] = edge_idx;
+}
+
+static inline void hpcq_inc_remove(HPCQGraph *g, uint64_t site, uint64_t edge_idx)
+{
+    for (uint64_t i = 0; i < g->inc_counts[site]; i++) {
+        if (g->inc_edges[site][i] == edge_idx) {
+            g->inc_edges[site][i] = g->inc_edges[site][--g->inc_counts[site]];
+            return;
+        }
+    }
 }
 
 static inline void hpcq_update_fidelity_stats(HPCQGraph *g)
@@ -309,18 +350,7 @@ static inline void hpcq_hadamard_absorb(HPCQGraph *g, uint64_t site)
 {
     static const double S = 0.7071067811865475244;  /* 1/√2 */
 
-    /* Count incident non-absorbed edges */
-    int n_inc = 0;
-    uint64_t e_idx = 0;
-
-    for (uint64_t e = 0; e < g->n_edges; e++) {
-        HPCQEdge *edge = &g->edges[e];
-        if (edge->type == HPCQ_EDGE_ABSORBED) continue;
-        if (edge->site_a == site || edge->site_b == site) {
-            n_inc++;
-            e_idx = e;
-        }
-    }
+    int n_inc = (int)g->inc_counts[site];
 
     /* Check if this site already has an absorb entry (re-apply H) */
     int existing_absorb = -1;
@@ -353,11 +383,6 @@ static inline void hpcq_hadamard_absorb(HPCQGraph *g, uint64_t site)
          * Dedup only within the outer group (same outer variable q).
          * Duplicates across inner/outer are correct — different variables. */
         uint64_t inner_start = old->n_inner;
-        for (uint64_t e = 0; e < g->n_edges; e++) {
-            HPCQEdge *edge = &g->edges[e];
-            if (edge->type == HPCQ_EDGE_ABSORBED) continue;
-            if (edge->site_a == site || edge->site_b == site) n_inc++;
-        }
         uint64_t total_max = old->n_nbrs + (uint64_t)n_inc;
         uint64_t *new_nbrs = (uint64_t *)calloc(total_max, sizeof(uint64_t));
         double *new_w_re = (double *)calloc(total_max * 4, sizeof(double));
@@ -368,56 +393,55 @@ static inline void hpcq_hadamard_absorb(HPCQGraph *g, uint64_t site)
         memcpy(new_w_re, old->w_re, old->n_nbrs * 4 * sizeof(double));
         memcpy(new_w_im, old->w_im, old->n_nbrs * 4 * sizeof(double));
 
-        for (uint64_t e = 0; e < g->n_edges; e++) {
+        for (uint64_t ii = 0; ii < (uint64_t)n_inc; ii++) {
+            uint64_t e = g->inc_edges[site][ii];
             HPCQEdge *edge = &g->edges[e];
-            if (edge->type == HPCQ_EDGE_ABSORBED) continue;
-            if (edge->site_a == site || edge->site_b == site) {
-                uint64_t p = (edge->site_a == site) ? edge->site_b : edge->site_a;
-                double e_re[2][2], e_im[2][2];
-                if (edge->type == HPCQ_EDGE_CZ) {
-                    for (int q = 0; q < 2; q++)
-                        for (int z = 0; z < 2; z++) {
-                            e_re[q][z] = ((q * z) % 2 == 0) ? 1.0 : -1.0;
-                            e_im[q][z] = 0.0;
-                        }
-                } else {
-                    for (int q = 0; q < 2; q++)
-                        for (int z = 0; z < 2; z++) {
-                            e_re[q][z] = edge->w_re[q][z];
-                            e_im[q][z] = edge->w_im[q][z];
-                        }
-                }
-                /* Dedup only against outer group (uses same variable q) */
-                int found = -1;
-                for (uint64_t k = inner_start; k < n_nbrs; k++)
-                    if (new_nbrs[k] == p) { found = (int)k; break; }
-                if (found >= 0) {
-                    for (int q = 0; q < 2; q++)
-                        for (int z = 0; z < 2; z++) {
-                            int idx = found * 4 + q * 2 + z;
-                            double wr = new_w_re[idx], wi = new_w_im[idx];
-                            new_w_re[idx] = wr * e_re[q][z] - wi * e_im[q][z];
-                            new_w_im[idx] = wr * e_im[q][z] + wi * e_re[q][z];
-                        }
-                } else {
-                    new_nbrs[n_nbrs] = p;
-                    for (int q = 0; q < 2; q++)
-                        for (int z = 0; z < 2; z++) {
-                            int idx = n_nbrs * 4 + q * 2 + z;
-                            new_w_re[idx] = e_re[q][z];
-                            new_w_im[idx] = e_im[q][z];
-                        }
-                    n_nbrs++;
-                }
-                edge->type = HPCQ_EDGE_ABSORBED;
+            uint64_t p = (edge->site_a == site) ? edge->site_b : edge->site_a;
+            double e_re[2][2], e_im[2][2];
+            if (edge->type == HPCQ_EDGE_CZ) {
+                for (int q = 0; q < 2; q++)
+                    for (int z = 0; z < 2; z++) {
+                        e_re[q][z] = ((q * z) % 2 == 0) ? 1.0 : -1.0;
+                        e_im[q][z] = 0.0;
+                    }
+            } else {
+                for (int q = 0; q < 2; q++)
+                    for (int z = 0; z < 2; z++) {
+                        e_re[q][z] = edge->w_re[q][z];
+                        e_im[q][z] = edge->w_im[q][z];
+                    }
             }
+            /* Dedup only against outer group (uses same variable q) */
+            int found = -1;
+            for (uint64_t k = inner_start; k < n_nbrs; k++)
+                if (new_nbrs[k] == p) { found = (int)k; break; }
+            if (found >= 0) {
+                for (int q = 0; q < 2; q++)
+                    for (int z = 0; z < 2; z++) {
+                        int idx = found * 4 + q * 2 + z;
+                        double wr = new_w_re[idx], wi = new_w_im[idx];
+                        new_w_re[idx] = wr * e_re[q][z] - wi * e_im[q][z];
+                        new_w_im[idx] = wr * e_im[q][z] + wi * e_re[q][z];
+                    }
+            } else {
+                new_nbrs[n_nbrs] = p;
+                for (int q = 0; q < 2; q++)
+                    for (int z = 0; z < 2; z++) {
+                        int idx = n_nbrs * 4 + q * 2 + z;
+                        new_w_re[idx] = e_re[q][z];
+                        new_w_im[idx] = e_im[q][z];
+                    }
+                n_nbrs++;
+            }
+            hpcq_inc_remove(g, site, e);
+            hpcq_inc_remove(g, p, e);
+            edge->type = HPCQ_EDGE_ABSORBED;
         }
 
         free(old->nbrs);
         free(old->w_re);
         free(old->w_im);
         old->n_nbrs = n_nbrs;
-        old->n_inner = old->n_inner;  /* preserved */
         old->nbrs = new_nbrs;
         old->w_re = new_w_re;
         old->w_im = new_w_im;
@@ -442,63 +466,58 @@ static inline void hpcq_hadamard_absorb(HPCQGraph *g, uint64_t site)
     }
 
     if (n_inc > 1) {
-        /* Multi-edge absorption: for each incident edge, store the edge matrix
-         * in y-z form where y is the summed-over pre-H index of the center site
-         * and z is the neighbor's bit value.
-         *   - CZ edges: w(y, z) = (-1)^{y·z}
-         *   - PHASE edges: use the stored w_re[y][z] directly (the first index
-         *     IS the site's own value — post-absorb = pre-next-absorb) */
+        /* Multi-edge absorption */
         uint64_t *nbrs = (uint64_t *)calloc(n_inc, sizeof(uint64_t));
         double *w_re = (double *)calloc(n_inc * 4, sizeof(double));
         double *w_im = (double *)calloc(n_inc * 4, sizeof(double));
         uint64_t n_nbrs = 0;
 
-        for (uint64_t e = 0; e < g->n_edges; e++) {
+        for (uint64_t ii = 0; ii < (uint64_t)n_inc; ii++) {
+            uint64_t e = g->inc_edges[site][ii];
             HPCQEdge *edge = &g->edges[e];
-            if (edge->type == HPCQ_EDGE_ABSORBED) continue;
-            if (edge->site_a == site || edge->site_b == site) {
-                uint64_t p = (edge->site_a == site) ? edge->site_b : edge->site_a;
+            uint64_t p = (edge->site_a == site) ? edge->site_b : edge->site_a;
 
-                double e_re[2][2], e_im[2][2];
-                if (edge->type == HPCQ_EDGE_CZ) {
-                    for (int y = 0; y < 2; y++)
-                        for (int z = 0; z < 2; z++) {
-                            e_re[y][z] = ((y * z) % 2 == 0) ? 1.0 : -1.0;
-                            e_im[y][z] = 0.0;
-                        }
-                } else {
-                    for (int y = 0; y < 2; y++)
-                        for (int z = 0; z < 2; z++) {
-                            e_re[y][z] = edge->w_re[y][z];
-                            e_im[y][z] = edge->w_im[y][z];
-                        }
-                }
-
-                int found = -1;
-                for (uint64_t k = 0; k < n_nbrs; k++)
-                    if (nbrs[k] == p) { found = (int)k; break; }
-
-                if (found >= 0) {
-                    for (int y = 0; y < 2; y++)
-                        for (int z = 0; z < 2; z++) {
-                            int idx = found * 4 + y * 2 + z;
-                            double wr = w_re[idx], wi = w_im[idx];
-                            w_re[idx] = wr * e_re[y][z] - wi * e_im[y][z];
-                            w_im[idx] = wr * e_im[y][z] + wi * e_re[y][z];
-                        }
-                } else {
-                    nbrs[n_nbrs] = p;
-                    for (int y = 0; y < 2; y++)
-                        for (int z = 0; z < 2; z++) {
-                            int idx = n_nbrs * 4 + y * 2 + z;
-                            w_re[idx] = e_re[y][z];
-                            w_im[idx] = e_im[y][z];
-                        }
-                    n_nbrs++;
-                }
-
-                edge->type = HPCQ_EDGE_ABSORBED;
+            double e_re[2][2], e_im[2][2];
+            if (edge->type == HPCQ_EDGE_CZ) {
+                for (int y = 0; y < 2; y++)
+                    for (int z = 0; z < 2; z++) {
+                        e_re[y][z] = ((y * z) % 2 == 0) ? 1.0 : -1.0;
+                        e_im[y][z] = 0.0;
+                    }
+            } else {
+                for (int y = 0; y < 2; y++)
+                    for (int z = 0; z < 2; z++) {
+                        e_re[y][z] = edge->w_re[y][z];
+                        e_im[y][z] = edge->w_im[y][z];
+                    }
             }
+
+            int found = -1;
+            for (uint64_t k = 0; k < n_nbrs; k++)
+                if (nbrs[k] == p) { found = (int)k; break; }
+
+            if (found >= 0) {
+                for (int y = 0; y < 2; y++)
+                    for (int z = 0; z < 2; z++) {
+                        int idx = found * 4 + y * 2 + z;
+                        double wr = w_re[idx], wi = w_im[idx];
+                        w_re[idx] = wr * e_re[y][z] - wi * e_im[y][z];
+                        w_im[idx] = wr * e_im[y][z] + wi * e_re[y][z];
+                    }
+            } else {
+                nbrs[n_nbrs] = p;
+                for (int y = 0; y < 2; y++)
+                    for (int z = 0; z < 2; z++) {
+                        int idx = n_nbrs * 4 + y * 2 + z;
+                        w_re[idx] = e_re[y][z];
+                        w_im[idx] = e_im[y][z];
+                    }
+                n_nbrs++;
+            }
+
+            hpcq_inc_remove(g, site, e);
+            hpcq_inc_remove(g, p, e);
+            edge->type = HPCQ_EDGE_ABSORBED;
         }
 
         /* Grow absorb array if needed */
@@ -533,6 +552,7 @@ static inline void hpcq_hadamard_absorb(HPCQGraph *g, uint64_t site)
     }
 
     /* Single-edge absorption (first time, exactly 1 incident edge) */
+    uint64_t e_idx = g->inc_edges[site][0];
     double a_re[2], a_im[2];
     tri_get_amplitudes(&g->locals[site], VIEW_EDGE, a_re, a_im);
 
@@ -628,7 +648,18 @@ static inline void hpcq_cz(HPCQGraph *g, uint64_t site_a, uint64_t site_b)
             ((edge->site_a == site_a && edge->site_b == site_b) ||
              (edge->site_a == site_b && edge->site_b == site_a))) {
             /* Cancel: swap-remove this edge */
-            g->edges[e] = g->edges[--g->n_edges];
+            hpcq_inc_remove(g, edge->site_a, e);
+            hpcq_inc_remove(g, edge->site_b, e);
+            uint64_t moved_idx = --g->n_edges;
+            if (moved_idx != e) {
+                uint64_t moved_sa = g->edges[moved_idx].site_a;
+                uint64_t moved_sb = g->edges[moved_idx].site_b;
+                hpcq_inc_remove(g, moved_sa, moved_idx);
+                hpcq_inc_remove(g, moved_sb, moved_idx);
+                g->edges[e] = g->edges[moved_idx];
+                hpcq_inc_add(g, moved_sa, e);
+                hpcq_inc_add(g, moved_sb, e);
+            }
             g->cz_edges--;
 
             HPCQGateEntry entry = {
@@ -644,7 +675,8 @@ static inline void hpcq_cz(HPCQGraph *g, uint64_t site_a, uint64_t site_b)
     /* No existing edge — add new one */
     hpcq_grow_edges(g);
 
-    HPCQEdge *e = &g->edges[g->n_edges];
+    uint64_t idx = g->n_edges;
+    HPCQEdge *e = &g->edges[idx];
     memset(e, 0, sizeof(HPCQEdge));
     e->type = HPCQ_EDGE_CZ;
     e->site_a = site_a;
@@ -653,6 +685,8 @@ static inline void hpcq_cz(HPCQGraph *g, uint64_t site_a, uint64_t site_b)
 
     g->n_edges++;
     g->cz_edges++;
+    hpcq_inc_add(g, site_a, idx);
+    hpcq_inc_add(g, site_b, idx);
 
     HPCQGateEntry entry = {
         .type = HPCQ_GATE_CZ,
@@ -715,6 +749,9 @@ static inline void hpcq_general_2site(HPCQGraph *g, uint64_t site_a,
 
     e->fidelity = (fidelity_count > 0) ? fidelity_sum / fidelity_count : 0.0;
 
+    uint64_t e_idx2 = g->n_edges;
+    hpcq_inc_add(g, site_a, e_idx2);
+    hpcq_inc_add(g, site_b, e_idx2);
     g->n_edges++;
     g->phase_edges++;
     hpcq_update_fidelity_stats(g);
