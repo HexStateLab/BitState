@@ -195,6 +195,9 @@ static inline HPCQSparseVector *hpcq_sparse_tree(const HPCQGraph *g,
                     else if (sb == site && sa < site) partner_site = (int)sa;
 
                     if (partner_site >= 0) {
+                        /* Skip edges consumed by multi-edge absorption */
+                        if (g->edges[e].type == HPCQ_EDGE_ABSORBED) continue;
+
                         uint32_t pv = current[b].indices[partner_site];
                         double w_re, w_im;
 
@@ -263,8 +266,18 @@ static inline HPCQSparseVector *hpcq_sparse_tree(const HPCQGraph *g,
         }
     }
 
-    /* Collect results */
+    /* Collect results — filter by absorb parity constraint */
     for (uint64_t b = 0; b < n_current; b++) {
+        int absorb_ok = 1;
+        for (uint64_t a = 0; a < g->n_absorb && absorb_ok; a++) {
+            uint64_t parity = 0;
+            for (uint64_t k = 0; k < g->absorb[a].n_nbrs; k++)
+                parity ^= current[b].indices[g->absorb[a].nbrs[k]];
+            if (current[b].indices[g->absorb[a].center] != parity)
+                absorb_ok = 0;
+        }
+        if (!absorb_ok) continue;
+
         double prob = current[b].re * current[b].re +
                       current[b].im * current[b].im;
         if (prob >= threshold)
