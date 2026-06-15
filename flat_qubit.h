@@ -203,6 +203,18 @@ static inline void flat_apply_phase(FlatQubit *fq, double theta)
     }
 }
 
+/* T gate: |1⟩→e^{iπ/4}|1⟩ */
+static inline void flat_apply_t(FlatQubit *fq)
+{
+    flat_apply_phase(fq, atan(1.0));
+}
+
+/* T† gate: |1⟩→e^{-iπ/4}|1⟩ */
+static inline void flat_apply_td(FlatQubit *fq)
+{
+    flat_apply_phase(fq, -atan(1.0));
+}
+
 /* Hadamard: always promotes (creates superposition from basis state) */
 static inline void flat_apply_hadamard(FlatQubit *fq)
 {

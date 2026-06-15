@@ -48,7 +48,8 @@ static const double HPCQ_W2_IM[2] = { 0.0,  0.0 };
 typedef enum {
     HPCQ_EDGE_CZ,        /* Exact CZ: w(a,b) = (-1)^(a·b), fidelity=1.0  */
     HPCQ_EDGE_PHASE,     /* General phase: w(a,b) = arbitrary 2×2 matrix   */
-    HPCQ_EDGE_CLIFFORD   /* Clifford-projected: from Pauli decomposition   */
+    HPCQ_EDGE_CLIFFORD,  /* Clifford-projected: from Pauli decomposition   */
+    HPCQ_EDGE_ABSORBED   /* Edge consumed by multi-edge H absorption       */
 } HPCQEdgeType;
 
 /* ═══════════════════════════════════════════════════════════════════════════════
@@ -98,6 +99,15 @@ typedef struct {
     double       fidelity;
 } HPCQGateEntry;
 
+/* Absorb entry: site whose H gate was absorbed with >1 incident CZ edges.
+ * The δ(z_center, parity) constraint is checked in hpcq_amplitude.
+ * nbrs is a flat array: [nbr_0...nbr_{n-1}] */
+typedef struct {
+    uint64_t  center;
+    uint64_t  n_nbrs;
+    uint64_t *nbrs;
+} HPCQAbsorbEntry;
+
 /* ═══════════════════════════════════════════════════════════════════════════════
  * HPC QUBIT GRAPH — The state representation
  *
@@ -113,6 +123,11 @@ typedef struct {
     uint64_t        n_edges;
     uint64_t        edge_cap;
     HPCQEdge       *edges;
+
+    /* Absorbed multi-edge H entries */
+    uint64_t        n_absorb;
+    uint64_t        absorb_cap;
+    HPCQAbsorbEntry *absorb;
 
     /* Gate log */
     uint64_t        n_log;
@@ -150,6 +165,11 @@ static inline HPCQGraph *hpcq_create(uint64_t n_sites)
     g->edges = (HPCQEdge *)calloc(g->edge_cap, sizeof(HPCQEdge));
     g->n_edges = 0;
 
+    g->n_absorb = 0;
+    g->absorb_cap = 4;
+    g->absorb = (HPCQAbsorbEntry *)calloc(g->absorb_cap, sizeof(HPCQAbsorbEntry));
+    if (!g->absorb) { free(g->locals); free(g->edges); free(g); return NULL; }
+
     g->log_cap = HPCQ_INIT_LOG;
     g->gate_log = (HPCQGateEntry *)calloc(g->log_cap, sizeof(HPCQGateEntry));
     g->n_log = 0;
@@ -163,6 +183,9 @@ static inline HPCQGraph *hpcq_create(uint64_t n_sites)
 static inline void hpcq_destroy(HPCQGraph *g)
 {
     if (!g) return;
+    for (uint64_t a = 0; a < g->n_absorb; a++)
+        free(g->absorb[a].nbrs);
+    free(g->absorb);
     free(g->locals);
     free(g->edges);
     free(g->gate_log);
@@ -233,6 +256,152 @@ static inline void hpcq_hadamard(HPCQGraph *g, uint64_t site)
     hpcq_log_gate(g, entry);
 }
 
+/* ──────────────────────────────────────────────────────────────────────────────
+ * hpcq_hadamard_absorb — H gate that correctly handles post-CZ qubits.
+ *
+ * Standard hpcq_hadamard only modifies the local Z-basis amplitude, which
+ * gives WRONG results for qubits with incident CZ edges (the edge phase
+ * (-1)^{x_k·x_j} must be evaluated under the sum over y created by H).
+ *
+ * This function absorbs the H gate into the edge matrix:
+ *   w'(x_k, x_j) = Σ_y H_{x_k,y} · a_k(y) · w_old(y, x_j)
+ *   a_k ← (1, 1)   (uniform representer — qubit is "consumed")
+ *
+ * CRITICAL: after absorption, all further non-diagonal gates on this site
+ * must ALSO be absorbed (re-absorption: edge' ← H × edge).  Diagonal gates
+ * (Z, S, T, phase) work directly on the local state without re-absorption.
+ *
+ * LIMITATION: sites with >1 incident edges cannot be handled — the sum
+ * over y couples all neighbors through their collective parity, creating
+ * an (m+1)-tensor that cannot be factorized into pairwise edges.
+ * ────────────────────────────────────────────────────────────────────────────── */
+static inline void hpcq_hadamard_absorb(HPCQGraph *g, uint64_t site)
+{
+    static const double S = 0.7071067811865475244;  /* 1/√2 */
+
+    /* Count incident edges and find the first one */
+    int n_inc = 0;
+    uint64_t e_idx = 0;
+
+    for (uint64_t e = 0; e < g->n_edges; e++) {
+        HPCQEdge *edge = &g->edges[e];
+        if (edge->site_a == site || edge->site_b == site) {
+            n_inc++;
+            e_idx = e;
+        }
+    }
+
+    if (n_inc == 0) {
+        hpcq_hadamard(g, site);
+        return;
+    }
+
+    if (n_inc > 1) {
+        /* Multi-edge absorption: replace CZ product (-1)^{z_v·s}
+         * with δ(z_v, s) checked in hpcq_amplitude.
+         * Collect unique neighbor indices, mark edges absorbed. */
+        uint64_t *nbrs = (uint64_t *)calloc(n_inc, sizeof(uint64_t));
+        uint64_t n_nbrs = 0;
+
+        for (uint64_t e = 0; e < g->n_edges; e++) {
+            HPCQEdge *edge = &g->edges[e];
+            if (edge->site_a == site || edge->site_b == site) {
+                uint64_t p = (edge->site_a == site) ? edge->site_b : edge->site_a;
+                int dup = 0;
+                for (uint64_t k = 0; k < n_nbrs; k++)
+                    if (nbrs[k] == p) { dup = 1; break; }
+                if (!dup) nbrs[n_nbrs++] = p;
+                edge->type = HPCQ_EDGE_ABSORBED;
+            }
+        }
+
+        /* Grow absorb array if needed */
+        if (g->n_absorb >= g->absorb_cap) {
+            g->absorb_cap = g->absorb_cap ? g->absorb_cap * 2 : 4;
+            g->absorb = (HPCQAbsorbEntry *)realloc(g->absorb,
+                        g->absorb_cap * sizeof(HPCQAbsorbEntry));
+        }
+
+        g->absorb[g->n_absorb].center = site;
+        g->absorb[g->n_absorb].n_nbrs = n_nbrs;
+        g->absorb[g->n_absorb].nbrs = nbrs;
+        g->n_absorb++;
+
+        /* Uniform representer */
+        double uni[2] = {1.0, 1.0}, zero[2] = {0.0, 0.0};
+        tri_init_state(&g->locals[site], VIEW_EDGE, uni, zero);
+
+        HPCQGateEntry entry = { .type = HPCQ_GATE_LOCAL_H, .site_a = site,
+                                .fidelity = 1.0 };
+        hpcq_log_gate(g, entry);
+        return;
+    }
+
+    /* Get local Z-basis amplitude at the site */
+    double a_re[2], a_im[2];
+    tri_get_amplitudes(&g->locals[site], VIEW_EDGE, a_re, a_im);
+
+    HPCQEdge *edge = &g->edges[e_idx];
+    uint64_t partner = (edge->site_a == site) ? edge->site_b : edge->site_a;
+
+    /* Compute w'(x_k, x_j) = Σ_y H_{x_k,y} · a_k(y) · w_old(y, x_j) */
+    double wr[2][2] = {{0}}, wi[2][2] = {{0}};
+
+    for (int xk = 0; xk < 2; xk++) {
+        for (int xj = 0; xj < 2; xj++) {
+            double sum_re = 0.0, sum_im = 0.0;
+
+            for (int y = 0; y < 2; y++) {
+                /* H matrix element H_{xk, y} */
+                double H_re = (xk == 0) ? S : (y == 0 ? S : -S);
+                double H_im = 0.0;
+
+                /* a_k(y) */
+                double a_r = a_re[y], a_i = a_im[y];
+
+                /* w_old(y, x_j) */
+                double w_re_yj, w_im_yj;
+                if (edge->type == HPCQ_EDGE_CZ) {
+                    uint32_t pi = (uint32_t)(y * xj) % 2;
+                    w_re_yj = (pi == 0) ? 1.0 : -1.0;
+                    w_im_yj = 0.0;
+                } else {
+                    w_re_yj = edge->w_re[y][xj];
+                    w_im_yj = edge->w_im[y][xj];
+                }
+
+                /* H × a_k(y) */
+                double ha_re = H_re * a_r - H_im * a_i;
+                double ha_im = H_re * a_i + H_im * a_r;
+
+                /* (H·a) × w */
+                sum_re += ha_re * w_re_yj - ha_im * w_im_yj;
+                sum_im += ha_re * w_im_yj + ha_im * w_re_yj;
+            }
+
+            wr[xk][xj] = sum_re;
+            wi[xk][xj] = sum_im;
+        }
+    }
+
+    /* Set local state to uniform representer (1, 1) */
+    double uni[2] = {1.0, 1.0}, zero[2] = {0.0, 0.0};
+    tri_init_state(&g->locals[site], VIEW_EDGE, uni, zero);
+
+    /* Replace the edge with the merged general edge */
+    edge->type = HPCQ_EDGE_PHASE;
+    edge->fidelity = 1.0;
+    memcpy(edge->w_re, wr, sizeof(wr));
+    memcpy(edge->w_im, wi, sizeof(wi));
+
+    /* Log */
+    HPCQGateEntry entry = { .type = HPCQ_GATE_LOCAL_H, .site_a = site,
+                            .fidelity = 1.0 };
+    hpcq_log_gate(g, entry);
+
+    (void)partner;
+}
+
 static inline void hpcq_phase(HPCQGraph *g, uint64_t site, double theta)
 {
     tri_apply_z(&g->locals[site], theta);
@@ -240,6 +409,18 @@ static inline void hpcq_phase(HPCQGraph *g, uint64_t site, double theta)
                             .fidelity = 1.0 };
     entry.params[0] = theta;
     hpcq_log_gate(g, entry);
+}
+
+/* T gate: |1⟩ → e^{iπ/4}|1⟩ — Z(π/4), exact, works everywhere */
+static inline void hpcq_t(HPCQGraph *g, uint64_t site)
+{
+    hpcq_phase(g, site, atan(1.0));  /* π/4 */
+}
+
+/* T† gate: |1⟩ → e^{-iπ/4}|1⟩ */
+static inline void hpcq_td(HPCQGraph *g, uint64_t site)
+{
+    hpcq_phase(g, site, -atan(1.0));
 }
 
 static inline void hpcq_x(HPCQGraph *g, uint64_t site)
@@ -404,6 +585,10 @@ static inline void hpcq_amplitude(const HPCQGraph *g,
     /* Step 2: Phase edge accumulation — O(E) */
     for (uint64_t e = 0; e < g->n_edges; e++) {
         const HPCQEdge *edge = &g->edges[e];
+
+        /* Skip edges consumed by multi-edge absorption */
+        if (edge->type == HPCQ_EDGE_ABSORBED) continue;
+
         uint32_t ia = indices[edge->site_a];
         uint32_t ib = indices[edge->site_b];
 
@@ -423,6 +608,17 @@ static inline void hpcq_amplitude(const HPCQGraph *g,
         double new_im = re * w_im + im * w_re;
         re = new_re;
         im = new_im;
+    }
+
+    /* Step 3: Multi-edge absorb parity check — O(n_absorb × degree)
+     * δ(z_center, Σ z_nbr mod 2): zero amplitude on violation */
+    for (uint64_t a = 0; a < g->n_absorb; a++) {
+        uint64_t parity = 0;
+        for (uint64_t k = 0; k < g->absorb[a].n_nbrs; k++)
+            parity ^= indices[g->absorb[a].nbrs[k]];
+        if (indices[g->absorb[a].center] != parity) {
+            re = 0.0; im = 0.0; break;
+        }
     }
 
     *out_re = re;
