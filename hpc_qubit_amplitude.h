@@ -272,17 +272,33 @@ static inline HPCQSparseVector *hpcq_sparse_tree(const HPCQGraph *g,
         double re = current[b].re, im = current[b].im;
         for (uint64_t a = 0; a < g->n_absorb; a++) {
             uint64_t center = g->absorb[a].center;
-            uint64_t parity = 0;
-            for (uint64_t k = 0; k < g->absorb[a].n_nbrs; k++)
-                parity ^= current[b].indices[g->absorb[a].nbrs[k]];
             int xv = (int)current[b].indices[center];
-            double sum_re = 0, sum_im = 0;
-            for (int y = 0; y < 2; y++) {
-                double H_re = (xv == 0) ? SQRT2 : (y == 0 ? SQRT2 : -SQRT2);
-                double phase = (y == 0 || parity == 0) ? 1.0 : -1.0;
-                sum_re += H_re * g->absorb[a].a_re[y] * phase;
-                sum_im += H_re * g->absorb[a].a_im[y] * phase;
+
+            double prod_re[2] = {1.0, 1.0};
+            double prod_im[2] = {0.0, 0.0};
+            for (uint64_t k = 0; k < g->absorb[a].n_nbrs; k++) {
+                int z = (int)current[b].indices[g->absorb[a].nbrs[k]];
+                for (int y = 0; y < 2; y++) {
+                    int idx = (int)k * 4 + y * 2 + z;
+                    double wr = g->absorb[a].w_re[idx];
+                    double wi = g->absorb[a].w_im[idx];
+                    double pr = prod_re[y], pi = prod_im[y];
+                    prod_re[y] = pr * wr - pi * wi;
+                    prod_im[y] = pr * wi + pi * wr;
+                }
             }
+
+            double sum_re = 0.0, sum_im = 0.0;
+            for (int y = 0; y < 2; y++) {
+                double Hy = (xv == 0) ? SQRT2 : (y == 0 ? SQRT2 : -SQRT2);
+                double ar = g->absorb[a].a_re[y];
+                double ai = g->absorb[a].a_im[y];
+                double pr = prod_re[y], pi = prod_im[y];
+                double hr = Hy * ar, hi = Hy * ai;
+                sum_re += hr * pr - hi * pi;
+                sum_im += hr * pi + hi * pr;
+            }
+
             double tmp_re = re * sum_re - im * sum_im;
             double tmp_im = re * sum_im + im * sum_re;
             re = tmp_re; im = tmp_im;

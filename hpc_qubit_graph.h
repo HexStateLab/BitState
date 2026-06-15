@@ -75,6 +75,12 @@ typedef struct {
 
     /* Quality metric */
     double       fidelity;        /* 1.0 = lossless                         */
+
+    /* Pre-absorption local amplitude (for y-form recovery during multi-edge).
+     * Set when this edge is created/modified by single-edge absorption.
+     * Zeros for non-absorb-created edges. */
+    double       absorb_a_re[2];
+    double       absorb_a_im[2];
 } HPCQEdge;
 
 /* ═══════════════════════════════════════════════════════════════════════════════
@@ -99,18 +105,20 @@ typedef struct {
     double       fidelity;
 } HPCQGateEntry;
 
-/* Absorb entry: site whose H gate was absorbed with >1 incident CZ edges.
- * The amplitude contribution for this site is:
- *   ψ_v(x_v, x_N) = Σ_y H_{x_v,y} · a_original(y) · (-1)^{y · parity(N)}
- * where a_original(y) is the Z-basis amplitude at absorption time.
- * The local state a'_v (set to uniform (1,1))
- * is then multiplied by any post-absorption diagonal gates (T, S, Z).
- * At evaluation: total = a'_v(x_v) × ψ_v(x_v, parity). */
+/* Absorb entry: site whose H gate was absorbed with >1 incident edges.
+ * For each neighbor k, w_re[k*4 + y*2 + z_k] and w_im[k*4 + y*2 + z_k]
+ * store the 2×2 edge matrix in y-z form (y = pre-H site index).
+ *   ψ_v(x_v, z_1..z_m) = Σ_y H_{x_v,y} · a_original(y) · Π_k w_k(y, z_k)
+ * The local state a'_v (set to uniform (1,1)) is multiplied by
+ * any post-absorption diagonal gates.
+ * At evaluation: total = a'_v(x_v) × ψ_v(x_v, z_1..z_m). */
 typedef struct {
     uint64_t  center;
     uint64_t  n_nbrs;
     uint64_t *nbrs;
-    double    a_re[2];   /* Z-basis amplitude at absorption time */
+    double   *w_re;       /* [n_nbrs * 4] — 2×2 per neighbor, y-z form */
+    double   *w_im;
+    double    a_re[2];    /* Z-basis amplitude at absorption time */
     double    a_im[2];
 } HPCQAbsorbEntry;
 
@@ -189,8 +197,11 @@ static inline HPCQGraph *hpcq_create(uint64_t n_sites)
 static inline void hpcq_destroy(HPCQGraph *g)
 {
     if (!g) return;
-    for (uint64_t a = 0; a < g->n_absorb; a++)
+    for (uint64_t a = 0; a < g->n_absorb; a++) {
         free(g->absorb[a].nbrs);
+        free(g->absorb[a].w_re);
+        free(g->absorb[a].w_im);
+    }
     free(g->absorb);
     free(g->locals);
     free(g->edges);
@@ -305,15 +316,11 @@ static inline void hpcq_hadamard_absorb(HPCQGraph *g, uint64_t site)
     }
 
     if (existing_absorb >= 0) {
-        /* Site was previously multi-edge absorbed.  Removing the absorb entry
-         * and restoring original local state is INSUFFICIENT because the CZ
-         * edges were consumed.  The correct H·(previous state) requires the
-         * full sum-over-y with the current local state, but without neighbors
-         * (edges gone) this degenerates to standard H on the current local.
-         * For arbitrary local state a', this gives H·a', which is correct for
-         * a 0-edge site — just hpcq_hadamard.  Remove the absorb entry,
-         * apply standard H.  The consumed CZ information is lost. */
+        /* Site was previously multi-edge absorbed.  The CZ edges are gone,
+         * so re-apply H degenerates to standard H on current local. */
         free(g->absorb[existing_absorb].nbrs);
+        free(g->absorb[existing_absorb].w_re);
+        free(g->absorb[existing_absorb].w_im);
         g->absorb[existing_absorb] = g->absorb[--g->n_absorb];
         hpcq_hadamard(g, site);
         return;
@@ -325,10 +332,13 @@ static inline void hpcq_hadamard_absorb(HPCQGraph *g, uint64_t site)
     }
 
     if (n_inc > 1) {
-        /* Multi-edge absorption: replace CZ product (-1)^{z_v·s}
-         * with δ(z_v, s) checked in hpcq_amplitude.
-         * Collect unique neighbor indices, mark edges absorbed. */
+        /* Multi-edge absorption: for each incident edge, recover
+         * the y-form w(y, z_k) and store in the absorb entry.
+         * For CZ edges: w(y, z) = (-1)^{y·z}.
+         * For PHASE edges: recover by Σ_x H_{x,y}·w'(x,z)/a_absorb(x). */
         uint64_t *nbrs = (uint64_t *)calloc(n_inc, sizeof(uint64_t));
+        double *w_re = (double *)calloc(n_inc * 4, sizeof(double));
+        double *w_im = (double *)calloc(n_inc * 4, sizeof(double));
         uint64_t n_nbrs = 0;
 
         for (uint64_t e = 0; e < g->n_edges; e++) {
@@ -336,10 +346,66 @@ static inline void hpcq_hadamard_absorb(HPCQGraph *g, uint64_t site)
             if (edge->type == HPCQ_EDGE_ABSORBED) continue;
             if (edge->site_a == site || edge->site_b == site) {
                 uint64_t p = (edge->site_a == site) ? edge->site_b : edge->site_a;
-                int dup = 0;
+
+                /* Compute y-form edge matrix w(y, z) for this edge */
+                double e_re[2][2], e_im[2][2];
+                if (edge->type == HPCQ_EDGE_CZ) {
+                    for (int y = 0; y < 2; y++)
+                        for (int z = 0; z < 2; z++) {
+                            e_re[y][z] = ((y * z) % 2 == 0) ? 1.0 : -1.0;
+                            e_im[y][z] = 0.0;
+                        }
+                } else {
+                    /* PHASE edge: recover w_original(y, z) from stored w'(x, z)
+                     * using absorb_a: w_original(y,z)=Σ_x H_{x,y}·w'(x,z)/a_absorb(x) */
+                    for (int y = 0; y < 2; y++) {
+                        for (int z = 0; z < 2; z++) {
+                            double sum_re = 0.0, sum_im = 0.0;
+                            for (int x = 0; x < 2; x++) {
+                                double Hxy = (y == 0) ? S : (x == 0 ? S : -S);
+                                sum_re += Hxy * edge->w_re[x][z];
+                                sum_im += Hxy * edge->w_im[x][z];
+                            }
+                            /* Divide by absorb_a(x) — only for x=y (from δ(x,y) in sum) */
+                            /* The sum gave Σ_x H_{x,y}·w'(x,z) = a_absorb(y)·w_original(y,z).
+                             * So w_original(y,z) = Σ_x H_{x,y}·w'(x,z) / a_absorb(y) */
+                            double ar = edge->absorb_a_re[y];
+                            double ai = edge->absorb_a_im[y];
+                            double mag2 = ar * ar + ai * ai;
+                            if (mag2 > 1e-30) {
+                                e_re[y][z] = (sum_re * ar + sum_im * ai) / mag2;
+                                e_im[y][z] = (sum_im * ar - sum_re * ai) / mag2;
+                            } else {
+                                e_re[y][z] = 1.0; e_im[y][z] = 0.0;
+                            }
+                        }
+                    }
+                }
+
+                /* Check for duplicate neighbor — multiply matrices */
+                int found = -1;
                 for (uint64_t k = 0; k < n_nbrs; k++)
-                    if (nbrs[k] == p) { dup = 1; break; }
-                if (!dup) nbrs[n_nbrs++] = p;
+                    if (nbrs[k] == p) { found = (int)k; break; }
+
+                if (found >= 0) {
+                    for (int y = 0; y < 2; y++)
+                        for (int z = 0; z < 2; z++) {
+                            int idx = found * 4 + y * 2 + z;
+                            double wr = w_re[idx], wi = w_im[idx];
+                            w_re[idx] = wr * e_re[y][z] - wi * e_im[y][z];
+                            w_im[idx] = wr * e_im[y][z] + wi * e_re[y][z];
+                        }
+                } else {
+                    nbrs[n_nbrs] = p;
+                    for (int y = 0; y < 2; y++)
+                        for (int z = 0; z < 2; z++) {
+                            int idx = n_nbrs * 4 + y * 2 + z;
+                            w_re[idx] = e_re[y][z];
+                            w_im[idx] = e_im[y][z];
+                        }
+                    n_nbrs++;
+                }
+
                 edge->type = HPCQ_EDGE_ABSORBED;
             }
         }
@@ -360,6 +426,8 @@ static inline void hpcq_hadamard_absorb(HPCQGraph *g, uint64_t site)
         g->absorb[g->n_absorb].center = site;
         g->absorb[g->n_absorb].n_nbrs = n_nbrs;
         g->absorb[g->n_absorb].nbrs = nbrs;
+        g->absorb[g->n_absorb].w_re = w_re;
+        g->absorb[g->n_absorb].w_im = w_im;
         g->absorb[g->n_absorb].a_re[0] = orig_re[0];
         g->absorb[g->n_absorb].a_re[1] = orig_re[1];
         g->absorb[g->n_absorb].a_im[0] = orig_im[0];
@@ -372,7 +440,7 @@ static inline void hpcq_hadamard_absorb(HPCQGraph *g, uint64_t site)
         return;
     }
 
-    /* Get local Z-basis amplitude at the site */
+    /* Get local Z-basis amplitude at the site (pre-absorption) */
     double a_re[2], a_im[2];
     tri_get_amplitudes(&g->locals[site], VIEW_EDGE, a_re, a_im);
 
@@ -385,39 +453,30 @@ static inline void hpcq_hadamard_absorb(HPCQGraph *g, uint64_t site)
     for (int xk = 0; xk < 2; xk++) {
         for (int xj = 0; xj < 2; xj++) {
             double sum_re = 0.0, sum_im = 0.0;
-
             for (int y = 0; y < 2; y++) {
-                /* H matrix element H_{xk, y} */
                 double H_re = (xk == 0) ? S : (y == 0 ? S : -S);
-                double H_im = 0.0;
-
-                /* a_k(y) */
-                double a_r = a_re[y], a_i = a_im[y];
-
-                /* w_old(y, x_j) */
+                double ha_re = H_re * a_re[y];
+                double ha_im = H_re * a_im[y];
                 double w_re_yj, w_im_yj;
                 if (edge->type == HPCQ_EDGE_CZ) {
-                    uint32_t pi = (uint32_t)(y * xj) % 2;
+                    uint32_t pi = (y * xj) % 2;
                     w_re_yj = (pi == 0) ? 1.0 : -1.0;
                     w_im_yj = 0.0;
                 } else {
                     w_re_yj = edge->w_re[y][xj];
                     w_im_yj = edge->w_im[y][xj];
                 }
-
-                /* H × a_k(y) */
-                double ha_re = H_re * a_r - H_im * a_i;
-                double ha_im = H_re * a_i + H_im * a_r;
-
-                /* (H·a) × w */
                 sum_re += ha_re * w_re_yj - ha_im * w_im_yj;
                 sum_im += ha_re * w_im_yj + ha_im * w_re_yj;
             }
-
             wr[xk][xj] = sum_re;
             wi[xk][xj] = sum_im;
         }
     }
+
+    /* Save pre-absorption amplitude for y-form recovery */
+    edge->absorb_a_re[0] = a_re[0]; edge->absorb_a_re[1] = a_re[1];
+    edge->absorb_a_im[0] = a_im[0]; edge->absorb_a_im[1] = a_im[1];
 
     /* Set local state to uniform representer (1, 1) */
     double uni[2] = {1.0, 1.0}, zero[2] = {0.0, 0.0};
@@ -433,8 +492,6 @@ static inline void hpcq_hadamard_absorb(HPCQGraph *g, uint64_t site)
     HPCQGateEntry entry = { .type = HPCQ_GATE_LOCAL_H, .site_a = site,
                             .fidelity = 1.0 };
     hpcq_log_gate(g, entry);
-
-    (void)partner;
 }
 
 static inline void hpcq_phase(HPCQGraph *g, uint64_t site, double theta)
@@ -646,27 +703,44 @@ static inline void hpcq_amplitude(const HPCQGraph *g,
     }
 
     /* Step 3: Multi-edge absorb correction
-     * For each absorbed center: multiply by
-     *   ψ_v(x_v, parity) = Σ_y H_{x_v,y} · a_original(y) · (-1)^{y·parity}
-     * where a_original(y) is the saved pre-absorption amplitude.
-     * The local state already contributes a'_v(x_v) (uniform or post-absorb gate).
-     * Total center factor = a'_v(x_v) × ψ_v(x_v, parity). */
+     * For each absorbed center:
+     *   ψ_v(x_v, z_1..z_m) = Σ_y H_{x_v,y} · a_original(y) · Π_k w_k(y, z_k)
+     * where w_k(y, z_k) is the y-form edge matrix for neighbor k.
+     * The local state already contributes a'_v(x_v) (post-absorb * diagonal gates).
+     * Total center factor = a'_v(x_v) × ψ_v(x_v, ...). */
     static const double SQ = 0.7071067811865475244;
     for (uint64_t a = 0; a < g->n_absorb; a++) {
         uint64_t center = g->absorb[a].center;
-        uint64_t parity = 0;
-        for (uint64_t k = 0; k < g->absorb[a].n_nbrs; k++)
-            parity ^= indices[g->absorb[a].nbrs[k]];
         int xv = (int)indices[center];
+
+        /* Compute Π_k w_k(y, z_k) for y = 0, 1 */
+        double prod_re[2] = {1.0, 1.0};
+        double prod_im[2] = {0.0, 0.0};
+        for (uint64_t k = 0; k < g->absorb[a].n_nbrs; k++) {
+            int z = (int)indices[g->absorb[a].nbrs[k]];
+            for (int y = 0; y < 2; y++) {
+                int idx = (int)k * 4 + y * 2 + z;
+                double wr = g->absorb[a].w_re[idx];
+                double wi = g->absorb[a].w_im[idx];
+                double pr = prod_re[y], pi = prod_im[y];
+                prod_re[y] = pr * wr - pi * wi;
+                prod_im[y] = pr * wi + pi * wr;
+            }
+        }
+
+        /* Σ_y H_{xv,y} · a_original(y) · prod_k(y) */
         double sum_re = 0.0, sum_im = 0.0;
         for (int y = 0; y < 2; y++) {
-            double H_re = (xv == 0) ? SQ : (y == 0 ? SQ : -SQ);
-            double phase = (y == 0 || parity == 0) ? 1.0 : -1.0;
-            double ha_re = H_re * g->absorb[a].a_re[y];
-            double ha_im = H_re * g->absorb[a].a_im[y];
-            sum_re += ha_re * phase;
-            sum_im += ha_im * phase;
+            double Hy = (xv == 0) ? SQ : (y == 0 ? SQ : -SQ);
+            double ar = g->absorb[a].a_re[y];
+            double ai = g->absorb[a].a_im[y];
+            double pr = prod_re[y], pi = prod_im[y];
+            double h_re = Hy * ar - 0.0 * ai;
+            double h_im = Hy * ai + 0.0 * ar;
+            sum_re += h_re * pr - h_im * pi;
+            sum_im += h_re * pi + h_im * pr;
         }
+
         double new_re = re * sum_re - im * sum_im;
         double new_im = re * sum_im + im * sum_re;
         re = new_re;
