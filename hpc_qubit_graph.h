@@ -861,241 +861,288 @@ static inline void hpcq_amplitude(const HPCQGraph *g,
         im = new_im;
     }
 
-    /* Step 3: Multi-edge absorb correction
-     * For each absorbed center:
-     *   ψ_v(x_v, z_1..z_m) = Σ_y H_{x_v,y} · a_original(y) · Π_k w_k(y, z_k)
-     * where w_k(y, z_k) is the y-form edge matrix for neighbor k.
+    /* Step 3: Handle absorbed centers via connected-component joint sums.
      *
-     * IMPORTANT: When two absorbed centers share an edge, the coupling
-     * should be between their INNER variables (y_i, y_j), not between
-     * an inner variable and an OUTCOME variable (y_i, z_j). The per-center
-     * product below EXCLUDES edges to other absorbed centers; those are
-     * handled via joint pair-wise evaluation in Step 4.
+     * Each absorbed center has an inner variable y_i ∈ {0,1}.  The
+     * correct amplitude for absorbed centers is:
+     *
+     *   ψ = Σ_{y_0..y_{n-1}} Π_i H[x_i][y_i] · a_re(i,y_i) · Π_{non-center k} w_k(y_i, z_k)
+     *                          · Π_{center-center edges (i,j)} w_{ij}(y_i, y_j)
+     *
+     * where the sum is over ALL inner variables jointly.  Centers that share
+     * a center-center edge must be summed together as a connected component.
+     *
+     * For n_layers==2, the inner variable y_i couples through H[q_i][y_i]
+     * with an outer variable q_i.  The joint sum then includes both.
      */
     static const double SQ = 0.7071067811865475244;
+    uint64_t n_absorb = g->n_absorb;
 
-    /* Temporary storage for pair correction (Step 4) — heap allocated */
-    uint64_t *has_center_nbr = (uint64_t *)calloc(g->n_absorb + 1, sizeof(uint64_t));
-    double (*in_re)[2] = (double (*)[2])calloc(g->n_absorb + 1, 2 * sizeof(double));
-    double (*in_im)[2] = (double (*)[2])calloc(g->n_absorb + 1, 2 * sizeof(double));
-    double (*po_re_a)[2] = (double (*)[2])calloc(g->n_absorb + 1, 2 * sizeof(double));
-    double (*po_im_a)[2] = (double (*)[2])calloc(g->n_absorb + 1, 2 * sizeof(double));
-    double (*ac_re_a)[2] = (double (*)[2])calloc(g->n_absorb + 1, 2 * sizeof(double));
-    double (*ac_im_a)[2] = (double (*)[2])calloc(g->n_absorb + 1, 2 * sizeof(double));
-    int *nl = (int *)calloc(g->n_absorb + 1, sizeof(int));
+    if (n_absorb == 0) {
+        *out_re = re;
+        *out_im = im;
+        ((HPCQGraph *)g)->amp_evals++;
+        return;
+    }
 
-    for (uint64_t a = 0; a < g->n_absorb; a++) {
-        uint64_t center = g->absorb[a].center;
-        int xv = (int)indices[center];
-        uint64_t n_inner = g->absorb[a].n_inner;
-        uint64_t n_nbrs = g->absorb[a].n_nbrs;
+    /* ── 3a: Self-factors (excluding center-center edges) ── */
+    double (*sf_re)[2] = (double (*)[2])calloc(n_absorb, 2 * sizeof(double));
+    double (*sf_im)[2] = (double (*)[2])calloc(n_absorb, 2 * sizeof(double));
+    double (*so_re)[2] = (double (*)[2])calloc(n_absorb, 2 * sizeof(double)); /* outer q-factor for n_layers=2 */
+    double (*so_im)[2] = (double (*)[2])calloc(n_absorb, 2 * sizeof(double));
+    double (*a_cur_re_a)[2] = (double (*)[2])calloc(n_absorb, 2 * sizeof(double));
+    double (*a_cur_im_a)[2] = (double (*)[2])calloc(n_absorb, 2 * sizeof(double));
+    int *nl_arr = (int *)calloc(n_absorb, sizeof(int));
 
-        /* Check for center neighbors */
-        has_center_nbr[a] = 0;
-        for (uint64_t k = 0; k < n_nbrs; k++)
-            if (g->absorb_idx[g->absorb[a].nbrs[k]] >= 0)
-                { has_center_nbr[a] = 1; break; }
+    for (uint64_t a = 0; a < n_absorb; a++) {
+        uint64_t ni = g->absorb[a].n_inner;
+        uint64_t nn = g->absorb[a].n_nbrs;
+        nl_arr[a] = (int)g->absorb[a].n_layers;
 
-        /* Inner product: Π w_k(y, z_k) for y = 0, 1 (k < n_inner) */
-        double pi_re[2] = {1.0, 1.0};
-        double pi_im[2] = {0.0, 0.0};
-        for (uint64_t k = 0; k < n_inner; k++) {
+        /* Inner (y) product over non-center neighbors */
+        double pi_re[2] = {1.0, 1.0}, pi_im[2] = {0.0, 0.0};
+        for (uint64_t k = 0; k < ni; k++) {
             uint64_t nb = g->absorb[a].nbrs[k];
-            if (has_center_nbr[a] && g->absorb_idx[nb] >= 0) continue;
+            if (g->absorb_idx[nb] >= 0) continue; /* skip center-center edges */
             int z = (int)indices[nb];
             for (int y = 0; y < 2; y++) {
                 int idx = (int)k * 4 + y * 2 + z;
-                double wr = g->absorb[a].w_re[idx];
-                double wi = g->absorb[a].w_im[idx];
+                double wr = g->absorb[a].w_re[idx], wi = g->absorb[a].w_im[idx];
                 double pr = pi_re[y], pim = pi_im[y];
                 pi_re[y] = pr * wr - pim * wi;
                 pi_im[y] = pr * wi + pim * wr;
             }
         }
-
-        /* Store inner factor a_re[y] · pi[y] for Step 4 */
-        double ar_y[2], ai_y[2];
-        ar_y[0] = g->absorb[a].a_re[0]; ai_y[0] = g->absorb[a].a_im[0];
-        ar_y[1] = g->absorb[a].a_re[1]; ai_y[1] = g->absorb[a].a_im[1];
         for (int y = 0; y < 2; y++) {
-            in_re[a][y] = ar_y[y] * pi_re[y] - ai_y[y] * pi_im[y];
-            in_im[a][y] = ar_y[y] * pi_im[y] + ai_y[y] * pi_re[y];
+            sf_re[a][y] = g->absorb[a].a_re[y] * pi_re[y] - g->absorb[a].a_im[y] * pi_im[y];
+            sf_im[a][y] = g->absorb[a].a_re[y] * pi_im[y] + g->absorb[a].a_im[y] * pi_re[y];
         }
 
-        nl[a] = (int)g->absorb[a].n_layers;
-
-        if (g->absorb[a].n_layers >= 2) {
-            double po_re_t[2] = {1.0, 1.0};
-            double po_im_t[2] = {0.0, 0.0};
-            for (uint64_t k = n_inner; k < n_nbrs; k++) {
+        /* Outer (q) factor for n_layers=2 (excluding center-center edges) */
+        if (nl_arr[a] >= 2) {
+            double po_re[2] = {1.0, 1.0}, po_im[2] = {0.0, 0.0};
+            for (uint64_t k = ni; k < nn; k++) {
                 uint64_t nb = g->absorb[a].nbrs[k];
-                if (has_center_nbr[a] && g->absorb_idx[nb] >= 0) continue;
+                if (g->absorb_idx[nb] >= 0) continue;
                 int z = (int)indices[nb];
                 for (int q = 0; q < 2; q++) {
                     int idx = (int)k * 4 + q * 2 + z;
-                    double wr = g->absorb[a].w_re[idx];
-                    double wi = g->absorb[a].w_im[idx];
-                    double pr = po_re_t[q], pim = po_im_t[q];
-                    po_re_t[q] = pr * wr - pim * wi;
-                    po_im_t[q] = pr * wi + pim * wr;
+                    double wr = g->absorb[a].w_re[idx], wi = g->absorb[a].w_im[idx];
+                    double pr = po_re[q], pim = po_im[q];
+                    po_re[q] = pr * wr - pim * wi;
+                    po_im[q] = pr * wi + pim * wr;
                 }
             }
-            po_re_a[a][0] = po_re_t[0]; po_im_a[a][0] = po_im_t[0];
-            po_re_a[a][1] = po_re_t[1]; po_im_a[a][1] = po_im_t[1];
-            ac_re_a[a][0] = g->absorb[a].a_cur_re[0]; ac_im_a[a][0] = g->absorb[a].a_cur_im[0];
-            ac_re_a[a][1] = g->absorb[a].a_cur_re[1]; ac_im_a[a][1] = g->absorb[a].a_cur_im[1];
+            so_re[a][0] = po_re[0]; so_im[a][0] = po_im[0];
+            so_re[a][1] = po_re[1]; so_im[a][1] = po_im[1];
+            a_cur_re_a[a][0] = g->absorb[a].a_cur_re[0];
+            a_cur_im_a[a][0] = g->absorb[a].a_cur_im[0];
+            a_cur_re_a[a][1] = g->absorb[a].a_cur_re[1];
+            a_cur_im_a[a][1] = g->absorb[a].a_cur_im[1];
+        }
+    }
 
-            if (!has_center_nbr[a]) {
-                double mid_re[2] = {0.0, 0.0}, mid_im[2] = {0.0, 0.0};
+    /* ── 3b: Find connected components in center-center graph ── */
+    uint64_t *comp_of = (uint64_t *)calloc(n_absorb, sizeof(uint64_t));
+    uint64_t n_comp = 0;
+
+    /* Stack-based DFS */
+    uint64_t *stack = (uint64_t *)calloc(n_absorb, sizeof(uint64_t));
+    for (uint64_t a = 0; a < n_absorb; a++) {
+        if (comp_of[a]) continue;
+        n_comp++;
+        comp_of[a] = n_comp;
+        uint64_t sp = 0;
+        stack[sp++] = a;
+        while (sp) {
+            uint64_t cur = stack[--sp];
+            for (uint64_t k = 0; k < g->absorb[cur].n_nbrs; k++) {
+                uint64_t nb = g->absorb[cur].nbrs[k];
+                int64_t aj = g->absorb_idx[nb];
+                if (aj < 0) continue;
+                uint64_t aju = (uint64_t)aj;
+                if (comp_of[aju]) continue;
+                comp_of[aju] = n_comp;
+                stack[sp++] = aju;
+            }
+        }
+    }
+    free(stack);
+
+    /* ── 3c: Per-component joint evaluation ── */
+    /* Build component member lists */
+    uint64_t *comp_size = (uint64_t *)calloc(n_comp + 1, sizeof(uint64_t));
+    for (uint64_t a = 0; a < n_absorb; a++) comp_size[comp_of[a]]++;
+    uint64_t **comp_members = (uint64_t **)calloc(n_comp + 1, sizeof(uint64_t *));
+    uint64_t *comp_cursor = (uint64_t *)calloc(n_comp + 1, sizeof(uint64_t));
+    for (uint64_t c = 1; c <= n_comp; c++)
+        comp_members[c] = (uint64_t *)calloc(comp_size[c], sizeof(uint64_t));
+    for (uint64_t a = 0; a < n_absorb; a++) {
+        uint64_t c = comp_of[a];
+        comp_members[c][comp_cursor[c]++] = a;
+    }
+    free(comp_cursor);
+
+    for (uint64_t c = 1; c <= n_comp; c++) {
+        uint64_t sz = comp_size[c];
+        uint64_t *mems = comp_members[c];
+
+        if (sz == 1) {
+            /* Single center — no center-center edges; per-center formula is exact */
+            uint64_t a = mems[0];
+            uint64_t xv = indices[g->absorb[a].center];
+            if (nl_arr[a] >= 2) {
+                /* n_layers=2 */
+                double mid_re[2] = {0,0}, mid_im[2] = {0,0};
                 for (int q = 0; q < 2; q++)
                     for (int y = 0; y < 2; y++) {
                         double Hqy = (q == 0) ? SQ : (y == 0 ? SQ : -SQ);
-                        double hr = Hqy * ar_y[y], hi = Hqy * ai_y[y];
-                        mid_re[q] += hr * pi_re[y] - hi * pi_im[y];
-                        mid_im[q] += hr * pi_im[y] + hi * pi_re[y];
+                        double hr = Hqy * sf_re[a][y], hi = Hqy * sf_im[a][y];
+                        mid_re[q] += hr;
+                        mid_im[q] += hi;
                     }
-                double sum_re = 0.0, sum_im = 0.0;
+                double sum_re = 0, sum_im = 0;
                 for (int q = 0; q < 2; q++) {
                     double Hxq = (xv == 0) ? SQ : (q == 0 ? SQ : -SQ);
-                    double cr = g->absorb[a].a_cur_re[q];
-                    double ci = g->absorb[a].a_cur_im[q];
-                    double cpor = cr * po_re_t[q] - ci * po_im_t[q];
-                    double cpoi = cr * po_im_t[q] + ci * po_re_t[q];
-                    double mr = mid_re[q], mi = mid_im[q];
-                    double comb_re = cpor * mr - cpoi * mi;
-                    double comb_im = cpor * mi + cpoi * mr;
+                    double aq_re = a_cur_re_a[a][q], aq_im = a_cur_im_a[a][q];
+                    double aq_po_re = aq_re * so_re[a][q] - aq_im * so_im[a][q];
+                    double aq_po_im = aq_re * so_im[a][q] + aq_im * so_re[a][q];
+                    double comb_re = aq_po_re * mid_re[q] - aq_po_im * mid_im[q];
+                    double comb_im = aq_po_re * mid_im[q] + aq_po_im * mid_re[q];
                     sum_re += Hxq * comb_re;
                     sum_im += Hxq * comb_im;
                 }
                 double new_re = re * sum_re - im * sum_im;
                 double new_im = re * sum_im + im * sum_re;
                 re = new_re; im = new_im;
-            }
-        } else {
-            po_re_a[a][0] = 1.0; po_im_a[a][0] = 0.0;
-            po_re_a[a][1] = 1.0; po_im_a[a][1] = 0.0;
-            ac_re_a[a][0] = 1.0; ac_im_a[a][0] = 0.0;
-            ac_re_a[a][1] = 1.0; ac_im_a[a][1] = 0.0;
-
-            if (!has_center_nbr[a]) {
-                double sum_re = 0.0, sum_im = 0.0;
+            } else {
+                /* n_layers=1 */
+                double sum_re = 0, sum_im = 0;
                 for (int y = 0; y < 2; y++) {
                     double Hy = (xv == 0) ? SQ : (y == 0 ? SQ : -SQ);
-                    double hr = Hy * ar_y[y], hi = Hy * ai_y[y];
-                    sum_re += hr * pi_re[y] - hi * pi_im[y];
-                    sum_im += hr * pi_im[y] + hi * pi_re[y];
+                    sum_re += Hy * sf_re[a][y];
+                    sum_im += Hy * sf_im[a][y];
                 }
                 double new_re = re * sum_re - im * sum_im;
                 double new_im = re * sum_im + im * sum_re;
                 re = new_re; im = new_im;
             }
+            continue;
         }
-    }
 
-    /* ──────────────────────────────────────────────────────────────────────
-     * Step 4: Center-center pair correction
-     *
-     * When two absorbed centers share an edge, the edge weight must couple
-     * their INNER variables (y_i, y_j). Per-center Step 3 excluded these
-     * edges; here we compute the correct joint factor for each pair.
-     *
-     *   inner[qi][qj] = Σ_{yi,yj} H[qi][yi]·in_i[yi]·H[qj][yj]·in_j[yj]·w_ij(yi,yj)
-     *
-     * For single-layer (n_layers==1):  J = inner[xi][xj]
-     * For multi-layer:  J = Σ_{qi,qj} H[xi][qi]·a_cur_i[qi]·po_i[qi]
-     *                         · H[xj][qj]·a_cur_j[qj]·po_j[qj]·inner[qi][qj]
-     * ────────────────────────────────────────────────────────────────────── */
-    for (uint64_t a = 0; a < g->n_absorb; a++) {
-        if (!has_center_nbr[a]) continue;
-        uint64_t ci = g->absorb[a].center;
-        for (uint64_t k = 0; k < g->absorb[a].n_nbrs; k++) {
-            uint64_t nb = g->absorb[a].nbrs[k];
-            int64_t aj_idx = g->absorb_idx[nb];
-            if (aj_idx < 0 || (uint64_t)aj_idx <= a) continue;
-            uint64_t aj = (uint64_t)aj_idx;
-            uint64_t cj = g->absorb[aj].center;
+        /* ── Component of size > 1: joint sum over inner variables ──
+         * For each center in the component, count its inner variables:
+         *   n_layers=1 → 1 variable (y)
+         *   n_layers=2 → 2 variables (q, y), with H[q][y] coupling
+         * We set up a bit assignment covering all variables in the component.
+         */
+        /* Compute variable layout: for each member, var_start and var_count */
+        uint64_t total_vars = 0;
+        uint64_t *var_start = (uint64_t *)calloc(sz, sizeof(uint64_t));
+        uint64_t *var_count = (uint64_t *)calloc(sz, sizeof(uint64_t));
+        for (uint64_t mi = 0; mi < sz; mi++) {
+            var_start[mi] = total_vars;
+            var_count[mi] = (nl_arr[mems[mi]] >= 2) ? 2 : 1;
+            total_vars += var_count[mi];
+        }
 
-            double w_re[2][2], w_im[2][2];
-            for (int yi = 0; yi < 2; yi++)
-                for (int yj = 0; yj < 2; yj++) {
-                    int idx = (int)k * 4 + yi * 2 + yj;
-                    w_re[yi][yj] = g->absorb[a].w_re[idx];
-                    w_im[yi][yj] = g->absorb[a].w_im[idx];
-                }
+        double comp_re = 0.0, comp_im = 0.0;
+        uint64_t n_assign = (uint64_t)1 << total_vars;
+        for (uint64_t assign = 0; assign < n_assign; assign++) {
+            double term_re = 1.0, term_im = 0.0;
 
-            double inner_re[2][2] = {{0,0},{0,0}}, inner_im[2][2] = {{0,0},{0,0}};
-            for (int qi = 0; qi < 2; qi++)
-                for (int qj = 0; qj < 2; qj++)
-                    for (int yi = 0; yi < 2; yi++) {
-                        double Hqiyi = (qi == 0) ? SQ : (yi == 0 ? SQ : -SQ);
-                        double ir_i = in_re[a][yi], ii_i = in_im[a][yi];
-                        for (int yj = 0; yj < 2; yj++) {
-                            double Hqjyj = (qj == 0) ? SQ : (yj == 0 ? SQ : -SQ);
-                            double ir_j = in_re[aj][yj], ii_j = in_im[aj][yj];
-                            double wr = w_re[yi][yj], wi = w_im[yi][yj];
-                            double p_re = (Hqiyi * ir_i) * (Hqjyj * ir_j)
-                                       - (Hqiyi * ii_i) * (Hqjyj * ii_j);
-                            double p_im = (Hqiyi * ir_i) * (Hqjyj * ii_j)
-                                       + (Hqiyi * ii_i) * (Hqjyj * ir_j);
-                            inner_re[qi][qj] += p_re * wr - p_im * wi;
-                            inner_im[qi][qj] += p_re * wi + p_im * wr;
-                        }
-                    }
-
-            int xi = (int)indices[ci], xj = (int)indices[cj];
-            double sum_re, sum_im;
-            int nli = nl[a], nlj = nl[aj];
-
-            if (nli >= 2 && nlj >= 2) {
-                sum_re = 0.0; sum_im = 0.0;
-                for (int qi = 0; qi < 2; qi++) {
-                    double Hxiqi = (xi == 0) ? SQ : (qi == 0 ? SQ : -SQ);
-                    double co_i_re = ac_re_a[a][qi] * po_re_a[a][qi] - ac_im_a[a][qi] * po_im_a[a][qi];
-                    double co_i_im = ac_re_a[a][qi] * po_im_a[a][qi] + ac_im_a[a][qi] * po_re_a[a][qi];
-                    double v1_re = Hxiqi * co_i_re, v1_im = Hxiqi * co_i_im;
-                    for (int qj = 0; qj < 2; qj++) {
-                        double Hxjqj = (xj == 0) ? SQ : (qj == 0 ? SQ : -SQ);
-                        double co_j_re = ac_re_a[aj][qj] * po_re_a[aj][qj] - ac_im_a[aj][qj] * po_im_a[aj][qj];
-                        double co_j_im = ac_re_a[aj][qj] * po_im_a[aj][qj] + ac_im_a[aj][qj] * po_re_a[aj][qj];
-                        double v2_re = Hxjqj * co_j_re, v2_im = Hxjqj * co_j_im;
-                        double vv_re = v1_re * v2_re - v1_im * v2_im;
-                        double vv_im = v1_re * v2_im + v1_im * v2_re;
-                        double ir = inner_re[qi][qj], ii = inner_im[qi][qj];
-                        sum_re += vv_re * ir - vv_im * ii;
-                        sum_im += vv_re * ii + vv_im * ir;
-                    }
-                }
-            } else if (nli >= 2 && nlj == 1) {
-                sum_re = 0.0; sum_im = 0.0;
-                for (int qi = 0; qi < 2; qi++) {
-                    double Hxiqi = (xi == 0) ? SQ : (qi == 0 ? SQ : -SQ);
-                    double co_i_re = ac_re_a[a][qi] * po_re_a[a][qi] - ac_im_a[a][qi] * po_im_a[a][qi];
-                    double co_i_im = ac_re_a[a][qi] * po_im_a[a][qi] + ac_im_a[a][qi] * po_re_a[a][qi];
-                    sum_re += Hxiqi * (co_i_re * inner_re[qi][xj] - co_i_im * inner_im[qi][xj]);
-                    sum_im += Hxiqi * (co_i_re * inner_im[qi][xj] + co_i_im * inner_re[qi][xj]);
-                }
-            } else if (nli == 1 && nlj >= 2) {
-                sum_re = 0.0; sum_im = 0.0;
-                for (int qj = 0; qj < 2; qj++) {
-                    double Hxjqj = (xj == 0) ? SQ : (qj == 0 ? SQ : -SQ);
-                    double co_j_re = ac_re_a[aj][qj] * po_re_a[aj][qj] - ac_im_a[aj][qj] * po_im_a[aj][qj];
-                    double co_j_im = ac_re_a[aj][qj] * po_im_a[aj][qj] + ac_im_a[aj][qj] * po_re_a[aj][qj];
-                    sum_re += Hxjqj * (co_j_re * inner_re[xi][qj] - co_j_im * inner_im[xi][qj]);
-                    sum_im += Hxjqj * (co_j_re * inner_im[xi][qj] + co_j_im * inner_re[xi][qj]);
-                }
-            } else {
-                sum_re = inner_re[xi][xj];
-                sum_im = inner_im[xi][xj];
+            /* Extract variable values for each center */
+            /* y[mi] = value of inner var, q[mi] = value of outer var (for n_layers=2) */
+            uint64_t y_val[sz], q_val[sz];
+            for (uint64_t mi = 0; mi < sz; mi++) {
+                uint64_t vs = var_start[mi];
+                y_val[mi] = (assign >> vs) & 1;
+                if (var_count[mi] == 2)
+                    q_val[mi] = (assign >> (vs + 1)) & 1;
+                else
+                    q_val[mi] = 0; /* not used */
             }
 
-            double new_re = re * sum_re - im * sum_im;
-            double new_im = re * sum_im + im * sum_re;
-            re = new_re; im = new_im;
+            /* Multiply by each center's self-factor and H factor */
+            for (uint64_t mi = 0; mi < sz; mi++) {
+                uint64_t a = mems[mi];
+                uint64_t xv = indices[g->absorb[a].center];
+                uint64_t y = y_val[mi];
+                double sfr = sf_re[a][y], sfi = sf_im[a][y];
+
+                if (var_count[mi] == 2) {
+                    uint64_t q = q_val[mi];
+                    /* Outer: H[xv][q] · a_cur(q) · so(q) */
+                    double Hxq = (xv == 0) ? SQ : (q == 0 ? SQ : -SQ);
+                    double cur_po_re = a_cur_re_a[a][q] * so_re[a][q] - a_cur_im_a[a][q] * so_im[a][q];
+                    double cur_po_im = a_cur_re_a[a][q] * so_im[a][q] + a_cur_im_a[a][q] * so_re[a][q];
+                    /* Inner: H[q][y] */
+                    double Hqy = (q == 0) ? SQ : (y == 0 ? SQ : -SQ);
+                    double factor_re = Hxq * (cur_po_re * (Hqy * sfr) - cur_po_im * (Hqy * sfi));
+                    double factor_im = Hxq * (cur_po_re * (Hqy * sfi) + cur_po_im * (Hqy * sfr));
+                    double new_re = term_re * factor_re - term_im * factor_im;
+                    double new_im = term_re * factor_im + term_im * factor_re;
+                    term_re = new_re; term_im = new_im;
+                } else {
+                    double Hy = (xv == 0) ? SQ : (y == 0 ? SQ : -SQ);
+                    double factor_re = Hy * sfr;
+                    double factor_im = Hy * sfi;
+                    double new_re = term_re * factor_re - term_im * factor_im;
+                    double new_im = term_re * factor_im + term_im * factor_re;
+                    term_re = new_re; term_im = new_im;
+                }
+            }
+
+            /* Multiply by center-center edge weights */
+            for (uint64_t mi = 0; mi < sz; mi++) {
+                uint64_t a = mems[mi];
+                double yi = (double)y_val[mi], qi = (double)q_val[mi];
+                for (uint64_t k = 0; k < g->absorb[a].n_nbrs; k++) {
+                    uint64_t nb = g->absorb[a].nbrs[k];
+                    int64_t aj_idx = g->absorb_idx[nb];
+                    if (aj_idx < 0) continue;
+                    uint64_t aj = (uint64_t)aj_idx;
+                    /* Find mi2 for this neighbor */
+                    uint64_t mi2 = 0;
+                    for (; mi2 < sz; mi2++)
+                        if (mems[mi2] == aj) break;
+                    if (mi2 == sz) continue; /* not in this component (shouldn't happen) */
+                    /* Only process each edge once (a < aj) */
+                    if (a >= aj) continue;
+                    uint64_t n_inner = g->absorb[a].n_inner;
+                    double va = (k < n_inner) ? yi : qi;
+                    double vb = (double)y_val[mi2]; /* inner var of neighbor (assume inner group) */
+                    /* CZ weight = (-1)^(va*vb) */
+                    double wr = ((va * vb) == 0.0) ? 1.0 : -1.0;
+                    double wi = 0.0;
+                    double new_re = term_re * wr - term_im * wi;
+                    double new_im = term_re * wi + term_im * wr;
+                    term_re = new_re; term_im = new_im;
+                }
+            }
+
+            comp_re += term_re;
+            comp_im += term_im;
         }
+
+        free(var_start);
+        free(var_count);
+
+        double new_re = re * comp_re - im * comp_im;
+        double new_im = re * comp_im + im * comp_re;
+        re = new_re; im = new_im;
     }
 
-    free(has_center_nbr); free(in_re); free(in_im);
-    free(po_re_a); free(po_im_a); free(ac_re_a); free(ac_im_a); free(nl);
+    /* Free temp arrays */
+    for (uint64_t c = 1; c <= n_comp; c++) free(comp_members[c]);
+    free(comp_members);
+    free(comp_size);
+    free(comp_of);
+    free(sf_re); free(sf_im);
+    free(so_re); free(so_im);
+    free(a_cur_re_a); free(a_cur_im_a);
+    free(nl_arr);
+
     *out_re = re;
     *out_im = im;
     ((HPCQGraph *)g)->amp_evals++;
