@@ -1100,7 +1100,6 @@ static inline void hpcq_amplitude(const HPCQGraph *g,
             /* Multiply by center-center edge weights */
             for (uint64_t mi = 0; mi < sz; mi++) {
                 uint64_t a = mems[mi];
-                uint64_t yi = y_val[mi];
                 for (uint64_t k = 0; k < g->absorb[a].n_nbrs; k++) {
                     uint64_t nb = g->absorb[a].nbrs[k];
                     int64_t aj_idx = g->absorb_idx[nb];
@@ -1110,13 +1109,13 @@ static inline void hpcq_amplitude(const HPCQGraph *g,
                     for (; mi2 < sz; mi2++)
                         if (mems[mi2] == aj) break;
                     if (mi2 == sz) continue;
-                    /* Each edge once (a < aj) */
                     if (a >= aj) continue;
-                    uint64_t yj = y_val[mi2];
-                    /* CZ weight uses inner variables: (-1)^(yi·yj) */
-                    double wr = ((yi * yj) == 0) ? 1.0 : -1.0;
-                    double new_re = term_re * wr - term_im * 0.0;
-                    double new_im = term_re * 0.0 + term_im * wr;
+                    uint64_t n_inner = g->absorb[a].n_inner;
+                    uint64_t va = (k < n_inner) ? y_val[mi] : q_val[mi];
+                    uint64_t vb = y_val[mi2];
+                    double wr = ((va * vb) == 0) ? 1.0 : -1.0;
+                    double new_re = term_re * wr;
+                    double new_im = term_im * wr;
                     term_re = new_re; term_im = new_im;
                 }
             }
