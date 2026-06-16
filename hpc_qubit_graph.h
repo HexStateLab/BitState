@@ -197,6 +197,7 @@ typedef struct {
     uint64_t        clifford_edges;
     double          min_fidelity;
     double          avg_fidelity;
+    uint64_t        global_phase_parity;
 } HPCQGraph;
 
 /* ═══════════════════════════════════════════════════════════════════════════════
@@ -402,6 +403,9 @@ static inline void hpcq_hadamard_absorb(HPCQGraph *g, uint64_t site)
             old->a_layer_re[(L-1)*2+1] = cur_re[1];
             old->a_layer_im[(L-1)*2] = cur_im[0];
             old->a_layer_im[(L-1)*2+1] = cur_im[1];
+            old->layer_x_parity = (uint8_t *)realloc(old->layer_x_parity,(L)*sizeof(uint8_t));
+            old->layer_x_parity[L-1] = old->x_parity;
+            old->x_parity = 0;
             old->n_layers = L + 1;
             double uni[2] = {1.0, 1.0}, zero[2] = {0.0, 0.0};
             tri_init_state(&g->locals[site], VIEW_EDGE, uni, zero);
@@ -826,6 +830,7 @@ static inline void hpcq_cz(HPCQGraph *g, uint64_t site_a, uint64_t site_b)
             /* Residual Z gate on neighbor from CZ·X·CZ = X·Z */
             if (fabs(xp_a) > 1e-15) tri_apply_z(&g->locals[site_b], xp_a);
             if (fabs(xp_b) > 1e-15) tri_apply_z(&g->locals[site_a], xp_b);
+            if (fabs(xp_a) > 1e-15 && fabs(xp_b) > 1e-15) g->global_phase_parity ^= 1;
 
             HPCQGateEntry entry = {
                 .type = HPCQ_GATE_CZ,
@@ -1028,6 +1033,7 @@ static inline void hpcq_amplitude(const HPCQGraph *g,
     uint64_t n_absorb = g->n_absorb;
 
     if (n_absorb == 0) {
+        if (g->global_phase_parity & 1) { re = -re; im = -im; }
         *out_re = re;
         *out_im = im;
         ((HPCQGraph *)g)->amp_evals++;
@@ -1037,10 +1043,8 @@ static inline void hpcq_amplitude(const HPCQGraph *g,
     /* ── 3a: Per-layer self-factors (excluding center-center edges) ── */
     double (*sf_re)[2] = (double (*)[2])calloc(n_absorb, 2 * sizeof(double));
     double (*sf_im)[2] = (double (*)[2])calloc(n_absorb, 2 * sizeof(double));
-    double (*so_re)[2] = (double (*)[2])calloc(n_absorb, 2 * sizeof(double));
-    double (*so_im)[2] = (double (*)[2])calloc(n_absorb, 2 * sizeof(double));
-    double (*a_cur_re_a)[2] = (double (*)[2])calloc(n_absorb, 2 * sizeof(double));
-    double (*a_cur_im_a)[2] = (double (*)[2])calloc(n_absorb, 2 * sizeof(double));
+    double **so_layer_re = (double **)calloc(n_absorb, sizeof(double *));
+    double **so_layer_im = (double **)calloc(n_absorb, sizeof(double *));
     double *na_cz_re = (double *)calloc(n_absorb, sizeof(double));
     double *na_cz_im = (double *)calloc(n_absorb, sizeof(double));
     int *nl_arr = (int *)calloc(n_absorb, sizeof(int));
@@ -1051,73 +1055,57 @@ static inline void hpcq_amplitude(const HPCQGraph *g,
         int L = (int)g->absorb[a].n_layers;
         nl_arr[a] = L;
 
-        /* For each layer ℓ: product over non-center neighbors at this layer.
-         * With n_layers=1: only layer 0 (sf)
-         * With n_layers>=2: layer 0..L-1, with sf for layer 0 and so for layer 1..L-1. */
         double pi_re[2] = {1.0, 1.0}, pi_im[2] = {0.0, 0.0};
-        double po_re[2] = {1.0, 1.0}, po_im[2] = {0.0, 0.0};
+        if (L > 1) {
+            so_layer_re[a] = (double *)calloc((L-1) * 2, sizeof(double));
+            so_layer_im[a] = (double *)calloc((L-1) * 2, sizeof(double));
+            for (int li = 0; li < L-1; li++) {
+                so_layer_re[a][li*2] = 1.0; so_layer_re[a][li*2+1] = 1.0;}}
 
         for (uint64_t k = 0; k < nn; k++) {
             uint64_t nb = g->absorb[a].nbrs[k];
-            if (g->absorb_idx[nb] >= 0) continue; /* center-center → component sum */
+            if (g->absorb_idx[nb] >= 0) continue;
             int li = (int)g->absorb[a].layer[k];
             int z = (int)indices[nb];
             for (int y = 0; y < 2; y++) {
                 int idx = (int)k * 4 + y * 2 + z;
                 double wr = g->absorb[a].w_re[idx], wi = g->absorb[a].w_im[idx];
-                double pr = (li == 0) ? pi_re[y] : po_re[y];
-                double pim = (li == 0) ? pi_im[y] : po_im[y];
-                if (li == 0) { pi_re[y] = pr * wr - pim * wi; pi_im[y] = pr * wi + pim * wr; }
-                else { po_re[y] = pr * wr - pim * wi; po_im[y] = pr * wi + pim * wr; }
-            }
-        }
-        /* Add non-absorbed CZ edges between this center and regular sites.
-         * These edges were added AFTER the last H absorption (from later CZ layers)
-         * so they belong to the outermost layer. */
+                if (li == 0) { double pr = pi_re[y], pim = pi_im[y];
+                    pi_re[y] = pr * wr - pim * wi; pi_im[y] = pr * wi + pim * wr; }
+                else { int sli = (li-1)*2 + y;
+                    double pr = so_layer_re[a][sli], pim = so_layer_im[a][sli];
+                    so_layer_re[a][sli] = pr * wr - pim * wi;
+                    so_layer_im[a][sli] = pr * wi + pim * wr; }}}
+
         if (L >= 1) {
             uint64_t q = g->absorb[a].center;
             for (uint64_t e = 0; e < g->n_edges; e++) {
                 const HPCQEdge *edge = &g->edges[e];
                 if (edge->type != HPCQ_EDGE_CZ) continue;
                 uint64_t other;
-                if (edge->site_a == q && g->absorb_idx[edge->site_b] < 0)
-                    other = edge->site_b;
-                else if (edge->site_b == q && g->absorb_idx[edge->site_a] < 0)
-                    other = edge->site_a;
-                else
-                    continue;
+                if (edge->site_a == q && g->absorb_idx[edge->site_b] < 0) other = edge->site_b;
+                else if (edge->site_b == q && g->absorb_idx[edge->site_a] < 0) other = edge->site_a;
+                else continue;
                 if (L == 1) {
-                    /* Single-layer: non-absorbed CZ uses measurement outcome xv,
-                     * not the inner variable y. Apply as factor outside the sum. */
                     int z = (int)indices[other];
                     int xv = (int)(indices[q] ^ g->absorb[a].x_parity);
                     double xp_q = (edge->site_a == q) ? edge->xp_a : edge->xp_b;
-                    uint8_t xp_o = (edge->site_a == q) ? edge->xp_b : edge->xp_a;
+                    double xp_o = (edge->site_a == q) ? edge->xp_b : edge->xp_a;
                     double wr = HPCQ_CZ_W(xv, z, xp_q, xp_o);
                     na_cz_re[a] *= wr; na_cz_im[a] *= wr;
                 } else {
                     int z = (int)indices[other];
                     double xp_q = (edge->site_a == q) ? edge->xp_a : edge->xp_b;
-                    uint8_t xp_o = (edge->site_a == q) ? edge->xp_b : edge->xp_a;
+                    double xp_o = (edge->site_a == q) ? edge->xp_b : edge->xp_a;
+                    int osli = (L-2)*2;
                     for (int yo = 0; yo < 2; yo++) {
                         double wr = HPCQ_CZ_W(yo, z, xp_q, xp_o);
-                        po_re[yo] *= wr; po_im[yo] *= wr;
-                    }
-                }
-            }
-        }
+                        so_layer_re[a][osli + yo] *= wr;
+                        so_layer_im[a][osli + yo] *= wr;}}}}
+
         for (int y = 0; y < 2; y++) {
             sf_re[a][y] = g->absorb[a].a_re[y] * pi_re[y] - g->absorb[a].a_im[y] * pi_im[y];
             sf_im[a][y] = g->absorb[a].a_re[y] * pi_im[y] + g->absorb[a].a_im[y] * pi_re[y];
-        }
-        so_re[a][0] = po_re[0]; so_im[a][0] = po_im[0];
-        so_re[a][1] = po_re[1]; so_im[a][1] = po_im[1];
-        if (L >= 2) {
-            /* a_cur = a_layer[0] (state before second H) */
-            a_cur_re_a[a][0] = g->absorb[a].a_layer_re[0];
-            a_cur_re_a[a][1] = g->absorb[a].a_layer_re[1];
-            a_cur_im_a[a][0] = g->absorb[a].a_layer_im[0];
-            a_cur_im_a[a][1] = g->absorb[a].a_layer_im[1];
         }
     }
 
@@ -1177,20 +1165,18 @@ static inline void hpcq_amplitude(const HPCQGraph *g,
 
             for (int li = 1; li < L; li++) {
                 double nxt_re[2] = {0,0}, nxt_im[2] = {0,0};
-                /* X parity between layers: Z on the PREVIOUS layer's variable y0 */
-                for (int yi = 0; yi < 2; yi++) {
-                    if (g->absorb[a].layer_x_parity &&
-                        g->absorb[a].layer_x_parity[li-1]) {
-                        if (yi == 1) { cur_re[yi] = -cur_re[yi]; cur_im[yi] = -cur_im[yi]; }
-                    }
+                if (li >= 2 && g->absorb[a].layer_x_parity &&
+                    g->absorb[a].layer_x_parity[li-2]) {
+                    cur_re[1] = -cur_re[1]; cur_im[1] = -cur_im[1];
                 }
                 for (int yo = 0; yo < 2; yo++) {
-                    double sfr = (li == 1) ?
-                        (a_cur_re_a[a][yo] * so_re[a][yo] - a_cur_im_a[a][yo] * so_im[a][yo]) :
-                        so_re[a][yo];
-                    double sfi = (li == 1) ?
-                        (a_cur_re_a[a][yo] * so_im[a][yo] + a_cur_im_a[a][yo] * so_re[a][yo]) :
-                        so_im[a][yo];
+                    int sli = (li - 1) * 2 + yo;
+                    double ar = g->absorb[a].a_layer_re[sli];
+                    double ai = g->absorb[a].a_layer_im[sli];
+                    double o_r = so_layer_re[a][sli];
+                    double o_i = so_layer_im[a][sli];
+                    double sfr = ar * o_r - ai * o_i;
+                    double sfi = ar * o_i + ai * o_r;
                     for (int yi = 0; yi < 2; yi++) {
                         double H_yo_yi = (yo == 0) ? SQ : (yi == 0 ? SQ : -SQ);
                         nxt_re[yo] += H_yo_yi * (sfr * cur_re[yi] - sfi * cur_im[yi]);
@@ -1285,10 +1271,14 @@ static inline void hpcq_amplitude(const HPCQGraph *g,
                             factor_re *= zf; factor_im *= zf;
                         }
                         double sfr, sfi;
-                        if (li == 1) {
-                            sfr = a_cur_re_a[a][y_val[mi][li]] * so_re[a][y_val[mi][li]] - a_cur_im_a[a][y_val[mi][li]] * so_im[a][y_val[mi][li]];
-                            sfi = a_cur_re_a[a][y_val[mi][li]] * so_im[a][y_val[mi][li]] + a_cur_im_a[a][y_val[mi][li]] * so_re[a][y_val[mi][li]];
-                        } else { sfr = so_re[a][y_val[mi][li]]; sfi = so_im[a][y_val[mi][li]]; }
+                        { int vv = (int)y_val[mi][li];
+                          int sli = (li-1)*2 + vv;
+                          double ar = g->absorb[a].a_layer_re[sli];
+                          double ai = g->absorb[a].a_layer_im[sli];
+                          double o_r = so_layer_re[a][sli];
+                          double o_i = so_layer_im[a][sli];
+                          sfr = ar * o_r - ai * o_i;
+                          sfi = ar * o_i + ai * o_r; }
                         double new_re = factor_re * (H_link * sfr) - factor_im * (H_link * sfi);
                         double new_im = factor_re * (H_link * sfi) + factor_im * (H_link * sfr);
                         factor_re = new_re; factor_im = new_im;
@@ -1436,15 +1426,13 @@ static inline void hpcq_amplitude(const HPCQGraph *g,
                 for (int li = 1; li < L; li++) {
                     uint64_t vp = vs + li - 1, vc = vs + li;
                     double sr0, si0, sr1, si1;
-                    if (li == 1) {
-                        sr0 = a_cur_re_a[a][0] * so_re[a][0] - a_cur_im_a[a][0] * so_im[a][0];
-                        si0 = a_cur_re_a[a][0] * so_im[a][0] + a_cur_im_a[a][0] * so_re[a][0];
-                        sr1 = a_cur_re_a[a][1] * so_re[a][1] - a_cur_im_a[a][1] * so_im[a][1];
-                        si1 = a_cur_re_a[a][1] * so_im[a][1] + a_cur_im_a[a][1] * so_re[a][1];
-                    } else {
-                        sr0 = so_re[a][0]; si0 = so_im[a][0];
-                        sr1 = so_re[a][1]; si1 = so_im[a][1];
-                    }
+                    { int sl0 = (li-1)*2, sl1 = sl0+1;
+                      double ar0=g->absorb[a].a_layer_re[sl0], ai0=g->absorb[a].a_layer_im[sl0];
+                      double ar1=g->absorb[a].a_layer_re[sl1], ai1=g->absorb[a].a_layer_im[sl1];
+                      double or0=so_layer_re[a][sl0], oi0=so_layer_im[a][sl0];
+                      double or1=so_layer_re[a][sl1], oi1=so_layer_im[a][sl1];
+                      sr0=ar0*or0-ai0*oi0; si0=ar0*oi0+ai0*or0;
+                      sr1=ar1*or1-ai1*oi1; si1=ar1*oi1+ai1*or1; }
                     /* Build 2-variable factor for H[yc][yp] * sf[yc] * Z_parity[yp] */
                     VE_F *f = &vf[nvf++]; memset(f,0,sizeof(VE_F));
                     f->vars[0] = vp; f->vars[1] = vc; f->n_vars = 2; f->n_vals = 4;
@@ -1727,8 +1715,8 @@ static inline void hpcq_amplitude(const HPCQGraph *g,
     free(comp_size);
     free(comp_of);
     free(sf_re); free(sf_im);
-    free(so_re); free(so_im);
-    free(a_cur_re_a); free(a_cur_im_a);
+    for (uint64_t a = 0; a < n_absorb; a++) { free(so_layer_re[a]); free(so_layer_im[a]); }
+    free(so_layer_re); free(so_layer_im);
     free(na_cz_re); free(na_cz_im);
     free(nl_arr);
 
