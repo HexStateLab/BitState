@@ -903,10 +903,11 @@ static inline void hpcq_amplitude(const HPCQGraph *g,
         uint64_t nn = g->absorb[a].n_nbrs;
         nl_arr[a] = (int)g->absorb[a].n_layers;
 
-        /* Inner (y) product over all neighbors */
+        /* Inner (y) product over non-center neighbors */
         double pi_re[2] = {1.0, 1.0}, pi_im[2] = {0.0, 0.0};
         for (uint64_t k = 0; k < ni; k++) {
             uint64_t nb = g->absorb[a].nbrs[k];
+            if (g->absorb_idx[nb] >= 0) continue; /* skip center-center edges — handled in component joint sum */
             int z = (int)indices[nb];
             for (int y = 0; y < 2; y++) {
                 int idx = (int)k * 4 + y * 2 + z;
@@ -921,11 +922,12 @@ static inline void hpcq_amplitude(const HPCQGraph *g,
             sf_im[a][y] = g->absorb[a].a_re[y] * pi_im[y] + g->absorb[a].a_im[y] * pi_re[y];
         }
 
-        /* Outer (q) factor for n_layers=2 */
+        /* Outer (q) factor for n_layers=2 (excluding center-center edges) */
         if (nl_arr[a] >= 2) {
             double po_re[2] = {1.0, 1.0}, po_im[2] = {0.0, 0.0};
             for (uint64_t k = ni; k < nn; k++) {
                 uint64_t nb = g->absorb[a].nbrs[k];
+                if (g->absorb_idx[nb] >= 0) continue; /* center-center edges handled in component joint sum */
                 int z = (int)indices[nb];
                 for (int q = 0; q < 2; q++) {
                     int idx = (int)k * 4 + q * 2 + z;
@@ -1091,6 +1093,30 @@ static inline void hpcq_amplitude(const HPCQGraph *g,
                     double factor_im = Hy * sfi;
                     double new_re = term_re * factor_re - term_im * factor_im;
                     double new_im = term_re * factor_im + term_im * factor_re;
+                    term_re = new_re; term_im = new_im;
+                }
+            }
+
+            /* Multiply by center-center edge weights */
+            for (uint64_t mi = 0; mi < sz; mi++) {
+                uint64_t a = mems[mi];
+                uint64_t yi = y_val[mi];
+                for (uint64_t k = 0; k < g->absorb[a].n_nbrs; k++) {
+                    uint64_t nb = g->absorb[a].nbrs[k];
+                    int64_t aj_idx = g->absorb_idx[nb];
+                    if (aj_idx < 0) continue;
+                    uint64_t aj = (uint64_t)aj_idx;
+                    uint64_t mi2 = 0;
+                    for (; mi2 < sz; mi2++)
+                        if (mems[mi2] == aj) break;
+                    if (mi2 == sz) continue;
+                    /* Each edge once (a < aj) */
+                    if (a >= aj) continue;
+                    uint64_t yj = y_val[mi2];
+                    /* CZ weight uses inner variables: (-1)^(yi·yj) */
+                    double wr = ((yi * yj) == 0) ? 1.0 : -1.0;
+                    double new_re = term_re * wr - term_im * 0.0;
+                    double new_im = term_re * 0.0 + term_im * wr;
                     term_re = new_re; term_im = new_im;
                 }
             }
