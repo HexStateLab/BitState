@@ -41,6 +41,10 @@
 static const double HPCQ_W2_RE[2] = { 1.0, -1.0 };
 static const double HPCQ_W2_IM[2] = { 0.0,  0.0 };
 
+/* Evaluate CZ weight with per-edge X parity: (-1)^((a^xp_a)·(b^xp_b)) */
+#define HPCQ_CZ_W(a, b, xpa, xpb) \
+    ((((a) ^ (xpa)) * ((b) ^ (xpb)) & 1) ? -1.0 : 1.0)
+
 /* ═══════════════════════════════════════════════════════════════════════════════
  * EDGE TYPES
  * ═══════════════════════════════════════════════════════════════════════════════ */
@@ -72,6 +76,12 @@ typedef struct {
 
     /* Clifford metadata (for CLIFFORD type) */
     uint8_t      pauli_channel;   /* Which Pauli basis (0=I, 1=Z, 2=X, 3=Y) */
+
+    /* Per-edge X parity: when X is applied to an endpoint of this edge,
+     * the corresponding xp toggles.  The CZ weight becomes
+     * (-1)^((a^xp_a)·(b^xp_b)) instead of (-1)^(a·b). */
+    uint8_t      xp_a;
+    uint8_t      xp_b;
 
     /* Quality metric */
     double       fidelity;        /* 1.0 = lossless                         */
@@ -423,9 +433,11 @@ static inline void hpcq_hadamard_absorb(HPCQGraph *g, uint64_t site)
             uint64_t p = (edge->site_a == site) ? edge->site_b : edge->site_a;
             double e_re[2][2], e_im[2][2];
             if (edge->type == HPCQ_EDGE_CZ) {
+                uint8_t xp_q = (edge->site_a == site) ? edge->xp_a : edge->xp_b;
+                uint8_t xp_z = (edge->site_a == site) ? edge->xp_b : edge->xp_a;
                 for (int q = 0; q < 2; q++)
                     for (int z = 0; z < 2; z++) {
-                        e_re[q][z] = ((q * z) % 2 == 0) ? 1.0 : -1.0;
+                        e_re[q][z] = HPCQ_CZ_W(q, z, xp_q, xp_z);
                         e_im[q][z] = 0.0;
                     }
             } else {
@@ -455,9 +467,11 @@ static inline void hpcq_hadamard_absorb(HPCQGraph *g, uint64_t site)
             hpcq_inc_remove(g, site, e);
             /* Keep in partner's incident list for bilayer center approach */
             if (edge->type == HPCQ_EDGE_CZ) {
+                uint8_t xp_y = (edge->site_a == site) ? edge->xp_a : edge->xp_b;
+                uint8_t xp_z = (edge->site_a == site) ? edge->xp_b : edge->xp_a;
                 for (int y = 0; y < 2; y++)
                     for (int z = 0; z < 2; z++) {
-                        edge->w_re[y][z] = (y * z) % 2 == 0 ? 1.0 : -1.0;
+                        edge->w_re[y][z] = HPCQ_CZ_W(y, z, xp_y, xp_z);
                         edge->w_im[y][z] = 0.0;
                     }
             }
@@ -515,9 +529,11 @@ static inline void hpcq_hadamard_absorb(HPCQGraph *g, uint64_t site)
 
             double e_re[2][2], e_im[2][2];
             if (edge->type == HPCQ_EDGE_CZ) {
+                uint8_t xp_y = (edge->site_a == site) ? edge->xp_a : edge->xp_b;
+                uint8_t xp_z = (edge->site_a == site) ? edge->xp_b : edge->xp_a;
                 for (int y = 0; y < 2; y++)
                     for (int z = 0; z < 2; z++) {
-                        e_re[y][z] = ((y * z) % 2 == 0) ? 1.0 : -1.0;
+                        e_re[y][z] = HPCQ_CZ_W(y, z, xp_y, xp_z);
                         e_im[y][z] = 0.0;
                     }
             } else {
@@ -563,9 +579,11 @@ static inline void hpcq_hadamard_absorb(HPCQGraph *g, uint64_t site)
              * both qubits' y variables.
              * Store the weight matrix for the partner to read later. */
             if (edge->type == HPCQ_EDGE_CZ) {
+                uint8_t xp_y = (edge->site_a == site) ? edge->xp_a : edge->xp_b;
+                uint8_t xp_z = (edge->site_a == site) ? edge->xp_b : edge->xp_a;
                 for (int y = 0; y < 2; y++)
                     for (int z = 0; z < 2; z++) {
-                        edge->w_re[y][z] = (y * z) % 2 == 0 ? 1.0 : -1.0;
+                        edge->w_re[y][z] = HPCQ_CZ_W(y, z, xp_y, xp_z);
                         edge->w_im[y][z] = 0.0;
                     }
             }
@@ -627,8 +645,9 @@ static inline void hpcq_hadamard_absorb(HPCQGraph *g, uint64_t site)
                 double ha_im = H_re * a_im[y];
                 double w_re_yj, w_im_yj;
                 if (edge->type == HPCQ_EDGE_CZ) {
-                    uint32_t pi = (y * xj) % 2;
-                    w_re_yj = (pi == 0) ? 1.0 : -1.0;
+                    uint8_t xp_y = (edge->site_a == site) ? edge->xp_a : edge->xp_b;
+                    uint8_t xp_xj = (edge->site_a == site) ? edge->xp_b : edge->xp_a;
+                    w_re_yj = HPCQ_CZ_W(y, xj, xp_y, xp_xj);
                     w_im_yj = 0.0;
                 } else {
                     /* Edge stores w[site_a_val][site_b_val].
@@ -706,16 +725,18 @@ static inline void hpcq_x(HPCQGraph *g, uint64_t site)
         g->absorb[ai].x_parity ^= 1;
     } else {
         /* Regular site: X and CZ don't commute. When X is applied to a
-         * site with incident CZ edges, the CZ²-X-CZ² sequence creates an
-         * extra Z phase (-1)^x_b on each CZ neighbor b.  Apply Z on each
-         * incident CZ neighbor to account for this. */
+         * site with incident CZ edges, the CZ weight transforms:
+         *   (-1)^(a·b) → (-1)^((a⊕1)·b) = (-1)^(a·b)·(-1)^b
+         * Instead of applying Z(π) to site b's local state (which would
+         * leak to other edges involving site b), toggle the per-edge X
+         * parity flag on this edge's endpoint. */
         tri_apply_x(&g->locals[site]);
         for (uint64_t ii = 0; ii < g->inc_counts[site]; ii++) {
             uint64_t e = g->inc_edges[site][ii];
             HPCQEdge *edge = &g->edges[e];
             if (edge->type == HPCQ_EDGE_CZ) {
-                uint64_t nb = (edge->site_a == site) ? edge->site_b : edge->site_a;
-                tri_apply_z(&g->locals[nb], M_PI);
+                if (edge->site_a == site) edge->xp_a ^= 1;
+                else edge->xp_b ^= 1;
             }
         }
     }
@@ -898,19 +919,20 @@ static inline void hpcq_amplitude(const HPCQGraph *g,
     }
 
     /* Step 2: Phase edge accumulation — O(E)
-     * Skip ABSORBED edges and center-center CZ edges (handled in component sum). */
+     * Skip ABSORBED edges and any CZ edge involving a center
+     * (center-regular handled in Step 3a, center-center in component sum). */
     for (uint64_t e = 0; e < g->n_edges; e++) {
         const HPCQEdge *edge = &g->edges[e];
 
         /* Skip edges consumed by multi-edge absorption */
         if (edge->type == HPCQ_EDGE_ABSORBED) continue;
 
-        /* Skip CZ edges between two centers — handled in component sum using
-         * outermost layer variables */
+        /* Skip CZ edges where either endpoint is a center — handled in
+         * Step 3a (center-regular) or component sum (center-center). */
         if (edge->type == HPCQ_EDGE_CZ) {
             int ca = (g->absorb_idx[edge->site_a] >= 0) ? 1 : 0;
             int cb = (g->absorb_idx[edge->site_b] >= 0) ? 1 : 0;
-            if (ca && cb) continue;
+            if (ca || cb) continue;
         }
 
         uint32_t ia = indices[edge->site_a];
@@ -919,10 +941,9 @@ static inline void hpcq_amplitude(const HPCQGraph *g,
         double w_re, w_im;
 
         if (edge->type == HPCQ_EDGE_CZ) {
-            /* CZ: (-1)^(ia·ib) — only -1 when both are 1 */
-            uint32_t phase_idx = (ia * ib) % HPCQ_D;
-            w_re = HPCQ_W2_RE[phase_idx];
-            w_im = HPCQ_W2_IM[phase_idx];
+            /* CZ: (-1)^((ia^xp_a)·(ib^xp_b)) */
+            double w_cz = HPCQ_CZ_W(ia, ib, edge->xp_a, edge->xp_b);
+            w_re = w_cz; w_im = 0.0;
         } else {
             w_re = edge->w_re[ia][ib];
             w_im = edge->w_im[ia][ib];
@@ -965,7 +986,10 @@ static inline void hpcq_amplitude(const HPCQGraph *g,
     double (*so_im)[2] = (double (*)[2])calloc(n_absorb, 2 * sizeof(double));
     double (*a_cur_re_a)[2] = (double (*)[2])calloc(n_absorb, 2 * sizeof(double));
     double (*a_cur_im_a)[2] = (double (*)[2])calloc(n_absorb, 2 * sizeof(double));
+    double *na_cz_re = (double *)calloc(n_absorb, sizeof(double));
+    double *na_cz_im = (double *)calloc(n_absorb, sizeof(double));
     int *nl_arr = (int *)calloc(n_absorb, sizeof(int));
+    for (uint64_t a = 0; a < n_absorb; a++) { na_cz_re[a] = 1.0; na_cz_im[a] = 0.0; }
 
     for (uint64_t a = 0; a < n_absorb; a++) {
         uint64_t nn = g->absorb[a].n_nbrs;
@@ -990,6 +1014,41 @@ static inline void hpcq_amplitude(const HPCQGraph *g,
                 double pim = (li == 0) ? pi_im[y] : po_im[y];
                 if (li == 0) { pi_re[y] = pr * wr - pim * wi; pi_im[y] = pr * wi + pim * wr; }
                 else { po_re[y] = pr * wr - pim * wi; po_im[y] = pr * wi + pim * wr; }
+            }
+        }
+        /* Add non-absorbed CZ edges between this center and regular sites.
+         * These edges were added AFTER the last H absorption (from later CZ layers)
+         * so they belong to the outermost layer. */
+        if (L >= 1) {
+            uint64_t q = g->absorb[a].center;
+            for (uint64_t e = 0; e < g->n_edges; e++) {
+                const HPCQEdge *edge = &g->edges[e];
+                if (edge->type != HPCQ_EDGE_CZ) continue;
+                uint64_t other;
+                if (edge->site_a == q && g->absorb_idx[edge->site_b] < 0)
+                    other = edge->site_b;
+                else if (edge->site_b == q && g->absorb_idx[edge->site_a] < 0)
+                    other = edge->site_a;
+                else
+                    continue;
+                if (L == 1) {
+                    /* Single-layer: non-absorbed CZ uses measurement outcome xv,
+                     * not the inner variable y. Apply as factor outside the sum. */
+                    int z = (int)indices[other];
+                    int xv = (int)(indices[q] ^ g->absorb[a].x_parity);
+                    uint8_t xp_q = (edge->site_a == q) ? edge->xp_a : edge->xp_b;
+                    uint8_t xp_o = (edge->site_a == q) ? edge->xp_b : edge->xp_a;
+                    double wr = HPCQ_CZ_W(xv, z, xp_q, xp_o);
+                    na_cz_re[a] *= wr; na_cz_im[a] *= wr;
+                } else {
+                    int z = (int)indices[other];
+                    uint8_t xp_q = (edge->site_a == q) ? edge->xp_a : edge->xp_b;
+                    uint8_t xp_o = (edge->site_a == q) ? edge->xp_b : edge->xp_a;
+                    for (int yo = 0; yo < 2; yo++) {
+                        double wr = HPCQ_CZ_W(yo, z, xp_q, xp_o);
+                        po_re[yo] *= wr; po_im[yo] *= wr;
+                    }
+                }
             }
         }
         for (int y = 0; y < 2; y++) {
@@ -1092,8 +1151,19 @@ static inline void hpcq_amplitude(const HPCQGraph *g,
                 sum_re += Hxy * cur_re[y];
                 sum_im += Hxy * cur_im[y];
             }
-            double new_re = re * sum_re - im * sum_im;
-            double new_im = re * sum_im + im * sum_re;
+            /* Multiply by local state at xv (captures T/S/Z after last H) */
+            double lst_re[2], lst_im[2];
+            tri_get_amplitudes((TrialityQubit *)&g->locals[g->absorb[a].center],
+                              VIEW_EDGE, lst_re, lst_im);
+            double lr = lst_re[xv], li = lst_im[xv];
+            double sr = sum_re * lr - sum_im * li;
+            double si = sum_re * li + sum_im * lr;
+            sum_re = sr; sum_im = si;
+            /* Apply non-absorbed CZ factors (L=1 center-regular edges) */
+            double nre = sum_re * na_cz_re[a] - sum_im * na_cz_im[a];
+            double nim = sum_re * na_cz_im[a] + sum_im * na_cz_re[a];
+            double new_re = re * nre - im * nim;
+            double new_im = re * nim + im * nre;
             re = new_re; im = new_im;
             continue;
         }
@@ -1112,7 +1182,7 @@ static inline void hpcq_amplitude(const HPCQGraph *g,
 
         /* Collect non-absorbed CZ edges within this component */
         #define MAX_NA_CE 128
-        uint64_t na_ce_a[MAX_NA_CE], na_ce_b[MAX_NA_CE], n_na_ce = 0;
+        uint64_t na_ce_a[MAX_NA_CE], na_ce_b[MAX_NA_CE], na_ce_e[MAX_NA_CE], n_na_ce = 0;
         for (uint64_t e = 0; e < g->n_edges && n_na_ce < MAX_NA_CE; e++) {
             const HPCQEdge *edge = &g->edges[e];
             if (edge->type != HPCQ_EDGE_CZ) continue;
@@ -1125,7 +1195,7 @@ static inline void hpcq_amplitude(const HPCQGraph *g,
             int dup = 0;
             for (uint64_t ei = 0; ei < n_na_ce; ei++)
                 if (na_ce_a[ei] == aa && na_ce_b[ei] == ab) { dup = 1; break; }
-            if (!dup) { na_ce_a[n_na_ce] = aa; na_ce_b[n_na_ce] = ab; n_na_ce++; }
+            if (!dup) { na_ce_a[n_na_ce] = aa; na_ce_b[n_na_ce] = ab; na_ce_e[n_na_ce] = e; n_na_ce++; }
         }
 
         #define MAX_LAYERS 16
@@ -1183,6 +1253,20 @@ static inline void hpcq_amplitude(const HPCQGraph *g,
                     double H_outer = (xv == 0) ? SQ : (y_val[mi][L-1] == 0 ? SQ : -SQ);
                     factor_re *= H_outer; factor_im *= H_outer;
                 }
+                /* Multiply by local state at xv (captures T/S/Z after last H) */
+                double lst_re[2], lst_im[2];
+                tri_get_amplitudes((TrialityQubit *)&g->locals[g->absorb[a].center],
+                                  VIEW_EDGE, lst_re, lst_im);
+                double lr = lst_re[xv], li = lst_im[xv];
+                double fr = factor_re * lr - factor_im * li;
+                double fi = factor_re * li + factor_im * lr;
+                factor_re = fr; factor_im = fi;
+                /* Apply non-absorbed CZ factors (L=1 center-regular edges) */
+                if (na_cz_re[a] != 1.0 || na_cz_im[a] != 0.0) {
+                    double nr = factor_re * na_cz_re[a] - factor_im * na_cz_im[a];
+                    double ni = factor_re * na_cz_im[a] + factor_im * na_cz_re[a];
+                    factor_re = nr; factor_im = ni;
+                }
                 double new_re = term_re * factor_re - term_im * factor_im;
                 double new_im = term_re * factor_im + term_im * factor_re;
                 term_re = new_re; term_im = new_im;
@@ -1205,23 +1289,45 @@ static inline void hpcq_amplitude(const HPCQGraph *g,
                     if (li >= (int)var_count[mi] || li >= (int)var_count[mi2]) continue;
                     uint64_t va = y_val[mi][li];
                     uint64_t vb = y_val[mi2][li];
-                    double wr = ((va * vb) == 0) ? 1.0 : -1.0;
+                    /* Find the edge between these two centers for xp */
+                    uint64_t ca = g->absorb[a].center, cb = nb;
+                    uint8_t xp_va = 0, xp_vb = 0;
+                    for (uint64_t ee = 0; ee < g->n_edges; ee++) {
+                        const HPCQEdge *ce = &g->edges[ee];
+                        if ((ce->site_a == ca && ce->site_b == cb) ||
+                            (ce->site_a == cb && ce->site_b == ca)) {
+                            xp_va = (ce->site_a == ca) ? ce->xp_a : ce->xp_b;
+                            xp_vb = (ce->site_a == ca) ? ce->xp_b : ce->xp_a;
+                            break;
+                        }
+                    }
+                    double wr = HPCQ_CZ_W(va, vb, xp_va, xp_vb);
                     term_re *= wr; term_im *= wr;
                 }
             }
 
             /* Non-absorbed CZ edges within component: outermost layer variables */
             for (uint64_t ei = 0; ei < n_na_ce; ei++) {
-                uint64_t aa = na_ce_a[ei], ab = na_ce_b[ei];
+                uint64_t aa = na_ce_a[ei], ab = na_ce_b[ei], ee = na_ce_e[ei];
+                const HPCQEdge *edge = &g->edges[ee];
                 uint64_t mi_a, mi_b;
                 for (mi_a = 0; mi_a < sz && mems[mi_a] != aa; mi_a++);
                 for (mi_b = 0; mi_b < sz && mems[mi_b] != ab; mi_b++);
                 if (mi_a >= sz || mi_b >= sz) continue;
                 int L_a = nl_arr[aa], L_b = nl_arr[ab];
+                /* For L=1: non-absorbed CZ uses POST-H measurement outcome,
+                 * not the inner (pre-H) variable y. For L>1: use outermost
+                 * layer variable (between last two H gates). */
                 if (L_a < 1 || L_b < 1) continue;
-                uint64_t va = y_val[mi_a][L_a - 1];
-                uint64_t vb = y_val[mi_b][L_b - 1];
-                double wr = ((va * vb) == 0) ? 1.0 : -1.0;
+                uint64_t va = (L_a == 1)
+                    ? (indices[g->absorb[aa].center] ^ g->absorb[aa].x_parity)
+                    : y_val[mi_a][L_a - 1];
+                uint64_t vb = (L_b == 1)
+                    ? (indices[g->absorb[ab].center] ^ g->absorb[ab].x_parity)
+                    : y_val[mi_b][L_b - 1];
+                uint8_t xp_a = (edge->site_a == g->absorb[aa].center) ? edge->xp_a : edge->xp_b;
+                uint8_t xp_b = (edge->site_a == g->absorb[aa].center) ? edge->xp_b : edge->xp_a;
+                double wr = HPCQ_CZ_W(va, vb, xp_a, xp_b);
                 term_re *= wr; term_im *= wr;
             }
 
@@ -1246,6 +1352,7 @@ static inline void hpcq_amplitude(const HPCQGraph *g,
     free(sf_re); free(sf_im);
     free(so_re); free(so_im);
     free(a_cur_re_a); free(a_cur_im_a);
+    free(na_cz_re); free(na_cz_im);
     free(nl_arr);
 
     *out_re = re;
@@ -1358,9 +1465,8 @@ static inline double hpcq_marginal(const HPCQGraph *g,
 
             double w_re, w_im;
             if (g->edges[e].type == HPCQ_EDGE_CZ) {
-                uint32_t phase_idx = (va * vb) % HPCQ_D;
-                w_re = HPCQ_W2_RE[phase_idx];
-                w_im = HPCQ_W2_IM[phase_idx];
+                w_re = HPCQ_CZ_W(va, vb, g->edges[e].xp_a, g->edges[e].xp_b);
+                w_im = 0.0;
             } else {
                 w_re = g->edges[e].w_re[va][vb];
                 w_im = g->edges[e].w_im[va][vb];
@@ -1424,9 +1530,10 @@ static inline uint32_t hpcq_measure(HPCQGraph *g, uint64_t site,
             for (int k = 0; k < HPCQ_D; k++) {
                 double w_re, w_im;
                 if (edge->type == HPCQ_EDGE_CZ) {
-                    uint32_t phase_idx = (outcome * (uint32_t)k) % HPCQ_D;
-                    w_re = HPCQ_W2_RE[phase_idx];
-                    w_im = HPCQ_W2_IM[phase_idx];
+                    uint8_t xp_s = (edge->site_a == site) ? edge->xp_a : edge->xp_b;
+                    uint8_t xp_p = (edge->site_a == site) ? edge->xp_b : edge->xp_a;
+                    w_re = HPCQ_CZ_W(outcome, k, xp_s, xp_p);
+                    w_im = 0.0;
                 } else if (edge->site_a == site) {
                     w_re = edge->w_re[outcome][k];
                     w_im = edge->w_im[outcome][k];
