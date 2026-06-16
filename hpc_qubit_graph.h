@@ -396,7 +396,8 @@ static inline void hpcq_hadamard_absorb(HPCQGraph *g, uint64_t site)
         memcpy(new_w_re, old->w_re, old->n_nbrs * 4 * sizeof(double));
         memcpy(new_w_im, old->w_im, old->n_nbrs * 4 * sizeof(double));
 
-        for (uint64_t ii = 0; ii < (uint64_t)n_inc; ii++) {
+        /* Iterate IN REVERSE to avoid swap-remove corruption */
+        for (int64_t ii = (int64_t)n_inc - 1; ii >= 0; ii--) {
             uint64_t e = g->inc_edges[site][ii];
             HPCQEdge *edge = &g->edges[e];
             uint64_t p = (edge->site_a == site) ? edge->site_b : edge->site_a;
@@ -473,14 +474,14 @@ static inline void hpcq_hadamard_absorb(HPCQGraph *g, uint64_t site)
         return;
     }
 
-    if (n_inc > 1) {
-        /* Multi-edge absorption */
+    if (n_inc >= 1) {
+        /* Multi-edge absorption (n_inc >= 1) */
         uint64_t *nbrs = (uint64_t *)calloc(n_inc, sizeof(uint64_t));
         double *w_re = (double *)calloc(n_inc * 4, sizeof(double));
         double *w_im = (double *)calloc(n_inc * 4, sizeof(double));
         uint64_t n_nbrs = 0;
 
-        for (uint64_t ii = 0; ii < (uint64_t)n_inc; ii++) {
+        for (int64_t ii = (int64_t)n_inc - 1; ii >= 0; ii--) {
             uint64_t e = g->inc_edges[site][ii];
             HPCQEdge *edge = &g->edges[e];
             uint64_t p = (edge->site_a == site) ? edge->site_b : edge->site_a;
@@ -693,11 +694,14 @@ static inline void hpcq_cz(HPCQGraph *g, uint64_t site_a, uint64_t site_b)
             if (moved_idx != e) {
                 uint64_t moved_sa = g->edges[moved_idx].site_a;
                 uint64_t moved_sb = g->edges[moved_idx].site_b;
+                int moved_type = g->edges[moved_idx].type;
                 hpcq_inc_remove(g, moved_sa, moved_idx);
                 hpcq_inc_remove(g, moved_sb, moved_idx);
                 g->edges[e] = g->edges[moved_idx];
-                hpcq_inc_add(g, moved_sa, e);
-                hpcq_inc_add(g, moved_sb, e);
+                if (moved_type != HPCQ_EDGE_ABSORBED) {
+                    hpcq_inc_add(g, moved_sa, e);
+                    hpcq_inc_add(g, moved_sb, e);
+                }
             }
             g->cz_edges--;
 
@@ -899,11 +903,10 @@ static inline void hpcq_amplitude(const HPCQGraph *g,
         uint64_t nn = g->absorb[a].n_nbrs;
         nl_arr[a] = (int)g->absorb[a].n_layers;
 
-        /* Inner (y) product over non-center neighbors */
+        /* Inner (y) product over all neighbors */
         double pi_re[2] = {1.0, 1.0}, pi_im[2] = {0.0, 0.0};
         for (uint64_t k = 0; k < ni; k++) {
             uint64_t nb = g->absorb[a].nbrs[k];
-            if (g->absorb_idx[nb] >= 0) continue; /* skip center-center edges */
             int z = (int)indices[nb];
             for (int y = 0; y < 2; y++) {
                 int idx = (int)k * 4 + y * 2 + z;
@@ -918,12 +921,11 @@ static inline void hpcq_amplitude(const HPCQGraph *g,
             sf_im[a][y] = g->absorb[a].a_re[y] * pi_im[y] + g->absorb[a].a_im[y] * pi_re[y];
         }
 
-        /* Outer (q) factor for n_layers=2 (excluding center-center edges) */
+        /* Outer (q) factor for n_layers=2 */
         if (nl_arr[a] >= 2) {
             double po_re[2] = {1.0, 1.0}, po_im[2] = {0.0, 0.0};
             for (uint64_t k = ni; k < nn; k++) {
                 uint64_t nb = g->absorb[a].nbrs[k];
-                if (g->absorb_idx[nb] >= 0) continue;
                 int z = (int)indices[nb];
                 for (int q = 0; q < 2; q++) {
                     int idx = (int)k * 4 + q * 2 + z;
@@ -1089,34 +1091,6 @@ static inline void hpcq_amplitude(const HPCQGraph *g,
                     double factor_im = Hy * sfi;
                     double new_re = term_re * factor_re - term_im * factor_im;
                     double new_im = term_re * factor_im + term_im * factor_re;
-                    term_re = new_re; term_im = new_im;
-                }
-            }
-
-            /* Multiply by center-center edge weights */
-            for (uint64_t mi = 0; mi < sz; mi++) {
-                uint64_t a = mems[mi];
-                double yi = (double)y_val[mi], qi = (double)q_val[mi];
-                for (uint64_t k = 0; k < g->absorb[a].n_nbrs; k++) {
-                    uint64_t nb = g->absorb[a].nbrs[k];
-                    int64_t aj_idx = g->absorb_idx[nb];
-                    if (aj_idx < 0) continue;
-                    uint64_t aj = (uint64_t)aj_idx;
-                    /* Find mi2 for this neighbor */
-                    uint64_t mi2 = 0;
-                    for (; mi2 < sz; mi2++)
-                        if (mems[mi2] == aj) break;
-                    if (mi2 == sz) continue; /* not in this component (shouldn't happen) */
-                    /* Only process each edge once (a < aj) */
-                    if (a >= aj) continue;
-                    uint64_t n_inner = g->absorb[a].n_inner;
-                    double va = (k < n_inner) ? yi : qi;
-                    double vb = (double)y_val[mi2]; /* inner var of neighbor (assume inner group) */
-                    /* CZ weight = (-1)^(va*vb) */
-                    double wr = ((va * vb) == 0.0) ? 1.0 : -1.0;
-                    double wi = 0.0;
-                    double new_re = term_re * wr - term_im * wi;
-                    double new_im = term_re * wi + term_im * wr;
                     term_re = new_re; term_im = new_im;
                 }
             }
