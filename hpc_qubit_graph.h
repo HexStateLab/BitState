@@ -1176,13 +1176,8 @@ static inline void hpcq_amplitude(const HPCQGraph *g,
 
             for (int li = 1; li < L; li++) {
                 double nxt_re[2] = {0,0}, nxt_im[2] = {0,0};
-                /* X parity between layers: Z on the PREVIOUS layer's variable y0 */
-                for (int yi = 0; yi < 2; yi++) {
-                    if (g->absorb[a].layer_x_parity &&
-                        g->absorb[a].layer_x_parity[li-1]) {
-                        if (yi == 1) { cur_re[yi] = -cur_re[yi]; cur_im[yi] = -cur_im[yi]; }
-                    }
-                }
+                int use_z = (g->absorb[a].layer_x_parity &&
+                             g->absorb[a].layer_x_parity[li-1]);
                 for (int yo = 0; yo < 2; yo++) {
                     int sli = (li - 1) * 2 + yo;
                     double ar = g->absorb[a].a_layer_re[sli];
@@ -1192,9 +1187,15 @@ static inline void hpcq_amplitude(const HPCQGraph *g,
                     double sfr = ar * or - ai * oi;
                     double sfi = ar * oi + ai * or;
                     for (int yi = 0; yi < 2; yi++) {
-                        double H_yo_yi = (yo == 0) ? SQ : (yi == 0 ? SQ : -SQ);
-                        nxt_re[yo] += H_yo_yi * (sfr * cur_re[yi] - sfi * cur_im[yi]);
-                        nxt_im[yo] += H_yo_yi * (sfr * cur_im[yi] + sfi * cur_re[yi]);
+                        /* H·X·H = Z = diag(1, -1): replace H with Z */
+                        double M;
+                        if (use_z) {
+                            M = (yo == yi) ? (yo == 0 ? 1.0 : -1.0) : 0.0;
+                        } else {
+                            M = (yo == 0) ? SQ : (yi == 0 ? SQ : -SQ);
+                        }
+                        nxt_re[yo] += M * (sfr * cur_re[yi] - sfi * cur_im[yi]);
+                        nxt_im[yo] += M * (sfr * cur_im[yi] + sfi * cur_re[yi]);
                     }
                 }
                 cur_re[0] = nxt_re[0]; cur_re[1] = nxt_re[1];
@@ -1279,10 +1280,15 @@ static inline void hpcq_amplitude(const HPCQGraph *g,
                     if (L >= 1) { factor_re = sf_re[a][y_val[mi][0]]; factor_im = sf_im[a][y_val[mi][0]]; }
                     else { factor_re = 1.0; factor_im = 0.0; }
                     for (int li = 1; li < L; li++) {
-                        double H_link = (y_val[mi][li] == 0) ? SQ : (y_val[mi][li-1] == 0 ? SQ : -SQ);
-                        if (g->absorb[a].layer_x_parity && g->absorb[a].layer_x_parity[li-1]) {
-                            double zf = (y_val[mi][li-1] == 0) ? 1.0 : -1.0;
-                            factor_re *= zf; factor_im *= zf;
+                        int use_z = (g->absorb[a].layer_x_parity &&
+                                     g->absorb[a].layer_x_parity[li-1]);
+                        double M;
+                        if (use_z) {
+                            M = (y_val[mi][li] == y_val[mi][li-1])
+                                ? (y_val[mi][li] == 0 ? 1.0 : -1.0) : 0.0;
+                        } else {
+                            M = (y_val[mi][li] == 0)
+                                ? SQ : (y_val[mi][li-1] == 0 ? SQ : -SQ);
                         }
                         double sfr, sfi;
                         {
@@ -1295,8 +1301,8 @@ static inline void hpcq_amplitude(const HPCQGraph *g,
                             sfr = ar * or - ai * oi;
                             sfi = ar * oi + ai * or;
                         }
-                        double new_re = factor_re * (H_link * sfr) - factor_im * (H_link * sfi);
-                        double new_im = factor_re * (H_link * sfi) + factor_im * (H_link * sfr);
+                        double new_re = factor_re * (M * sfr) - factor_im * (M * sfi);
+                        double new_im = factor_re * (M * sfi) + factor_im * (M * sfr);
                         factor_re = new_re; factor_im = new_im;
                     }
                     if (L >= 1) {
@@ -1474,15 +1480,19 @@ static inline void hpcq_amplitude(const HPCQGraph *g,
                     f->vars[0] = vp; f->vars[1] = vc; f->n_vars = 2; f->n_vals = 4;
                     for (int yp = 0; yp < 2; yp++) {
                         for (int yc = 0; yc < 2; yc++) {
-                            double H = (yc == 0) ? SQ : (yp == 0 ? SQ : -SQ);
-                            double zf = 1.0;
-                            if (g->absorb[a].layer_x_parity && g->absorb[a].layer_x_parity[li-1] && yp == 1)
-                                zf = -1.0;
+                            int use_z = (g->absorb[a].layer_x_parity &&
+                                         g->absorb[a].layer_x_parity[li-1]);
+                            double M;
+                            if (use_z) {
+                                M = (yc == yp) ? (yc == 0 ? 1.0 : -1.0) : 0.0;
+                            } else {
+                                M = (yc == 0) ? SQ : (yp == 0 ? SQ : -SQ);
+                            }
                             double sf = (yc == 0) ? sr0 : sr1;
                             double si = (yc == 0) ? si0 : si1;
                             int idx = yp * 2 + yc;
-                            f->re[idx] = H * sf * zf;
-                            f->im[idx] = H * si * zf;
+                            f->re[idx] = M * sf;
+                            f->im[idx] = M * si;
                         }
                     }
                 }
