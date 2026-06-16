@@ -115,21 +115,32 @@ typedef struct {
  * (k >= n_inner).  The evaluation uses two nested sums:
  *   ψ_v(x_v, zs) = Σ_q H[x_v][q] · a_cur(q) · Π_{outer} w_k(q, z_k)
  *                   · Σ_y  H[q][y]  · a_re(y)   · Π_{inner} w_k(y, z_k)
- * This correctly handles new CZ edges (which use the outer variable q)
- * alongside the original absorbed edges (which use the inner variable y).
- * Diagonal gates (T, S) between the two H operations modify a_cur. */
+ * Multi-layer extension: for L layers, variable y_ℓ (ℓ=0..L-1, ℓ=0 innermost).
+ * Neighbor k at layer[k] couples y_{layer[k]} of this center to
+ * y_{layer[k]} of the partner center.  State before layer ℓ's H:
+ *   ℓ = 0 → a_re/a_im
+ *   ℓ >= 1 → a_layer_re[(ℓ-1)*2 .. (ℓ-1)*2+1] / a_layer_im
+ * Evaluation for L layers:
+ *   ψ_v(x_v) = Σ_{y_0..y_{L-1}} H[x_v][y_{L-1}] · state(L-1,y_{L-1})
+ *               · Π_{k: layer[k]=L-1} w_k(y_{L-1}, partner_y)
+ *               · H[y_{L-1}][y_{L-2}] · state(L-2,y_{L-2})
+ *               · Π_{k: layer[k]=L-2} w_k(y_{L-2}, partner_y) · ...
+ *               · H[y_1][y_0] · state(0,y_0) · Π_{k: layer[k]=0} w_k(y_0, partner_y)
+ * Diagonal gates (T, S) between H operations modify per-layer states. */
 typedef struct {
     uint64_t  center;
     uint64_t  n_nbrs;
-    uint64_t  n_inner;   /* first n_inner neighbors are inner group */
     uint64_t *nbrs;
-    double   *w_re;       /* [n_nbrs * 4] — inner then outer */
+    uint8_t  *layer;      /* [n_nbrs]: layer index for each neighbor */
+    double   *w_re;       /* [n_nbrs * 4] */
     double   *w_im;
-    double    a_re[2];    /* Z-basis amplitude at FIRST absorption time */
+    int       n_layers;
+    double    a_re[2];    /* state BEFORE layer 0's H */
     double    a_im[2];
-    int       n_layers;   /* 1 or 2 */
-    double    a_cur_re[2];/* pre-H local state for second layer */
-    double    a_cur_im[2];
+    double   *a_layer_re; /* [max(0, n_layers-1) * 2] — state before layer ℓ (ℓ>=1) */
+    double   *a_layer_im;
+    uint8_t   x_parity;   /* number of X gates mod 2 since last H absorption */
+    uint8_t  *layer_x_parity; /* [max(0, n_layers-1)] — X parity stored when each layer was created */
 } HPCQAbsorbEntry;
 
 /* ═══════════════════════════════════════════════════════════════════════════════
@@ -229,6 +240,10 @@ static inline void hpcq_destroy(HPCQGraph *g)
         free(g->absorb[a].nbrs);
         free(g->absorb[a].w_re);
         free(g->absorb[a].w_im);
+        free(g->absorb[a].layer);
+        free(g->absorb[a].a_layer_re);
+        free(g->absorb[a].a_layer_im);
+        free(g->absorb[a].layer_x_parity);
     }
     free(g->absorb);
     free(g->locals);
@@ -361,19 +376,22 @@ static inline void hpcq_hadamard_absorb(HPCQGraph *g, uint64_t site)
     /* Check if this site already has an absorb entry (re-apply H) — O(1) via index */
     int existing_absorb = (int)g->absorb_idx[site];
 
-    /* ─── Re-absorption: H gate applied again on an already-absorbed site ─── */
+    /* ─── Re-absorption: H gate on an already-absorbed site ─── */
     if (existing_absorb >= 0) {
         HPCQAbsorbEntry *old = &g->absorb[existing_absorb];
         double cur_re[2], cur_im[2];
         tri_get_amplitudes(&g->locals[site], VIEW_EDGE, cur_re, cur_im);
 
         if (n_inc == 0) {
-            /* No new edges: just record the second H layer */
-            old->n_layers = 2;
-            old->a_cur_re[0] = cur_re[0];
-            old->a_cur_re[1] = cur_re[1];
-            old->a_cur_im[0] = cur_im[0];
-            old->a_cur_im[1] = cur_im[1];
+            /* No new edges: just record a new H layer */
+            int L = old->n_layers;
+            old->a_layer_re = (double *)realloc(old->a_layer_re, (L) * 2 * sizeof(double));
+            old->a_layer_im = (double *)realloc(old->a_layer_im, (L) * 2 * sizeof(double));
+            old->a_layer_re[(L-1)*2] = cur_re[0];
+            old->a_layer_re[(L-1)*2+1] = cur_re[1];
+            old->a_layer_im[(L-1)*2] = cur_im[0];
+            old->a_layer_im[(L-1)*2+1] = cur_im[1];
+            old->n_layers = L + 1;
             double uni[2] = {1.0, 1.0}, zero[2] = {0.0, 0.0};
             tri_init_state(&g->locals[site], VIEW_EDGE, uni, zero);
             HPCQGateEntry entry = { .type = HPCQ_GATE_LOCAL_H, .site_a = site,
@@ -382,17 +400,19 @@ static inline void hpcq_hadamard_absorb(HPCQGraph *g, uint64_t site)
             return;
         }
 
-        /* Merge: old edges stay inner, new edges go to outer group.
-         * Dedup only within the outer group (same outer variable q).
-         * Duplicates across inner/outer are correct — different variables. */
-        uint64_t inner_start = old->n_inner;
+        /* Merge: old neighbors keep their layers; new edges get layer = old->n_layers
+         * (the next layer index).  NEVER combine weights — each layer has its own
+         * independent variable, so same partner at different layers is correct. */
+        int new_layer = old->n_layers;  /* the layer index being added now */
         uint64_t total_max = old->n_nbrs + (uint64_t)n_inc;
         uint64_t *new_nbrs = (uint64_t *)calloc(total_max, sizeof(uint64_t));
+        uint8_t *new_layer_arr = (uint8_t *)calloc(total_max, sizeof(uint8_t));
         double *new_w_re = (double *)calloc(total_max * 4, sizeof(double));
         double *new_w_im = (double *)calloc(total_max * 4, sizeof(double));
         uint64_t n_nbrs = old->n_nbrs;
 
         memcpy(new_nbrs, old->nbrs, old->n_nbrs * sizeof(uint64_t));
+        memcpy(new_layer_arr, old->layer, old->n_nbrs * sizeof(uint8_t));
         memcpy(new_w_re, old->w_re, old->n_nbrs * 4 * sizeof(double));
         memcpy(new_w_im, old->w_im, old->n_nbrs * 4 * sizeof(double));
 
@@ -420,45 +440,52 @@ static inline void hpcq_hadamard_absorb(HPCQGraph *g, uint64_t site)
                         }
                     }
             }
-            /* Dedup only against outer group (uses same variable q) */
-            int found = -1;
-            for (uint64_t k = inner_start; k < n_nbrs; k++)
-                if (new_nbrs[k] == p) { found = (int)k; break; }
-            if (found >= 0) {
-                for (int q = 0; q < 2; q++)
-                    for (int z = 0; z < 2; z++) {
-                        int idx = found * 4 + q * 2 + z;
-                        double wr = new_w_re[idx], wi = new_w_im[idx];
-                        new_w_re[idx] = wr * e_re[q][z] - wi * e_im[q][z];
-                        new_w_im[idx] = wr * e_im[q][z] + wi * e_re[q][z];
-                    }
-            } else {
-                new_nbrs[n_nbrs] = p;
-                for (int q = 0; q < 2; q++)
-                    for (int z = 0; z < 2; z++) {
-                        int idx = n_nbrs * 4 + q * 2 + z;
-                        new_w_re[idx] = e_re[q][z];
-                        new_w_im[idx] = e_im[q][z];
-                    }
-                n_nbrs++;
-            }
+
+            /* Always add as NEW neighbor with current layer — never combine */
+            new_nbrs[n_nbrs] = p;
+            new_layer_arr[n_nbrs] = (uint8_t)new_layer;
+            for (int q = 0; q < 2; q++)
+                for (int z = 0; z < 2; z++) {
+                    int idx = n_nbrs * 4 + q * 2 + z;
+                    new_w_re[idx] = e_re[q][z];
+                    new_w_im[idx] = e_im[q][z];
+                }
+            n_nbrs++;
+
             hpcq_inc_remove(g, site, e);
-            hpcq_inc_remove(g, p, e);
+            /* Keep in partner's incident list for bilayer center approach */
+            if (edge->type == HPCQ_EDGE_CZ) {
+                for (int y = 0; y < 2; y++)
+                    for (int z = 0; z < 2; z++) {
+                        edge->w_re[y][z] = (y * z) % 2 == 0 ? 1.0 : -1.0;
+                        edge->w_im[y][z] = 0.0;
+                    }
+            }
             edge->type = HPCQ_EDGE_ABSORBED;
         }
 
         free(old->nbrs);
+        free(old->layer);
         free(old->w_re);
         free(old->w_im);
         old->n_nbrs = n_nbrs;
         old->nbrs = new_nbrs;
+        old->layer = new_layer_arr;
         old->w_re = new_w_re;
         old->w_im = new_w_im;
-        old->n_layers = 2;
-        old->a_cur_re[0] = cur_re[0];
-        old->a_cur_re[1] = cur_re[1];
-        old->a_cur_im[0] = cur_im[0];
-        old->a_cur_im[1] = cur_im[1];
+
+        /* Store state before this H as a_layer entry for the new layer */
+        int L_new = old->n_layers + 1;  /* old->n_layers is the count BEFORE this re-absorption */
+        old->a_layer_re = (double *)realloc(old->a_layer_re, (L_new - 1) * 2 * sizeof(double));
+        old->a_layer_im = (double *)realloc(old->a_layer_im, (L_new - 1) * 2 * sizeof(double));
+        old->a_layer_re[(L_new - 2) * 2] = cur_re[0];
+        old->a_layer_re[(L_new - 2) * 2 + 1] = cur_re[1];
+        old->a_layer_im[(L_new - 2) * 2] = cur_im[0];
+        old->a_layer_im[(L_new - 2) * 2 + 1] = cur_im[1];
+        old->layer_x_parity = (uint8_t *)realloc(old->layer_x_parity, (L_new - 1) * sizeof(uint8_t));
+        old->layer_x_parity[L_new - 2] = old->x_parity;
+        old->x_parity = 0;
+        old->n_layers = L_new;
 
         double uni[2] = {1.0, 1.0}, zero[2] = {0.0, 0.0};
         tri_init_state(&g->locals[site], VIEW_EDGE, uni, zero);
@@ -530,7 +557,18 @@ static inline void hpcq_hadamard_absorb(HPCQGraph *g, uint64_t site)
             }
 
             hpcq_inc_remove(g, site, e);
-            hpcq_inc_remove(g, p, e);
+            /* Keep edge in PARTNER's incident list so partner can also create
+             * an absorb entry for this edge — both qubits become centers and
+             * the CZ weight is evaluated in the component joint sum using
+             * both qubits' y variables.
+             * Store the weight matrix for the partner to read later. */
+            if (edge->type == HPCQ_EDGE_CZ) {
+                for (int y = 0; y < 2; y++)
+                    for (int z = 0; z < 2; z++) {
+                        edge->w_re[y][z] = (y * z) % 2 == 0 ? 1.0 : -1.0;
+                        edge->w_im[y][z] = 0.0;
+                    }
+            }
             edge->type = HPCQ_EDGE_ABSORBED;
         }
 
@@ -549,8 +587,9 @@ static inline void hpcq_hadamard_absorb(HPCQGraph *g, uint64_t site)
         uint64_t ai = g->n_absorb;
         g->absorb[ai].center = site;
         g->absorb[ai].n_nbrs = n_nbrs;
-        g->absorb[ai].n_inner = n_nbrs;
         g->absorb[ai].nbrs = nbrs;
+        g->absorb[ai].layer = (uint8_t *)calloc(n_nbrs, sizeof(uint8_t));
+        memset(g->absorb[ai].layer, 0, n_nbrs * sizeof(uint8_t));
         g->absorb[ai].w_re = w_re;
         g->absorb[ai].w_im = w_im;
         g->absorb[ai].a_re[0] = orig_re[0];
@@ -558,6 +597,10 @@ static inline void hpcq_hadamard_absorb(HPCQGraph *g, uint64_t site)
         g->absorb[ai].a_im[0] = orig_im[0];
         g->absorb[ai].a_im[1] = orig_im[1];
         g->absorb[ai].n_layers = 1;
+        g->absorb[ai].a_layer_re = NULL;
+        g->absorb[ai].a_layer_im = NULL;
+        g->absorb[ai].x_parity = 0;
+        g->absorb[ai].layer_x_parity = NULL;
         g->absorb_idx[site] = (int64_t)ai;
         g->n_absorb++;
 
@@ -573,7 +616,6 @@ static inline void hpcq_hadamard_absorb(HPCQGraph *g, uint64_t site)
     tri_get_amplitudes(&g->locals[site], VIEW_EDGE, a_re, a_im);
 
     HPCQEdge *edge = &g->edges[e_idx];
-    uint64_t partner = (edge->site_a == site) ? edge->site_b : edge->site_a;
 
     double wr[2][2] = {{0}}, wi[2][2] = {{0}};
     for (int xk = 0; xk < 2; xk++) {
@@ -658,7 +700,16 @@ static inline void hpcq_td(HPCQGraph *g, uint64_t site)
 
 static inline void hpcq_x(HPCQGraph *g, uint64_t site)
 {
-    tri_apply_x(&g->locals[site]);
+    int64_t ai = g->absorb_idx[site];
+    if (ai >= 0) {
+        /* Center qubit: toggle X parity instead of modifying local state.
+         * The center's local state [1,1] represents |+⟩, which is an X eigenstate,
+         * so X on the local state has no effect.  Instead we flip the parity
+         * which will XOR the observed xv in the amplitude calculation. */
+        g->absorb[ai].x_parity ^= 1;
+    } else {
+        tri_apply_x(&g->locals[site]);
+    }
     HPCQGateEntry entry = { .type = HPCQ_GATE_LOCAL_X, .site_a = site,
                             .fidelity = 1.0 };
     hpcq_log_gate(g, entry);
@@ -837,12 +888,21 @@ static inline void hpcq_amplitude(const HPCQGraph *g,
         im = new_im;
     }
 
-    /* Step 2: Phase edge accumulation — O(E) */
+    /* Step 2: Phase edge accumulation — O(E)
+     * Skip ABSORBED edges and center-center CZ edges (handled in component sum). */
     for (uint64_t e = 0; e < g->n_edges; e++) {
         const HPCQEdge *edge = &g->edges[e];
 
         /* Skip edges consumed by multi-edge absorption */
         if (edge->type == HPCQ_EDGE_ABSORBED) continue;
+
+        /* Skip CZ edges between two centers — handled in component sum using
+         * outermost layer variables */
+        if (edge->type == HPCQ_EDGE_CZ) {
+            int ca = (g->absorb_idx[edge->site_a] >= 0) ? 1 : 0;
+            int cb = (g->absorb_idx[edge->site_b] >= 0) ? 1 : 0;
+            if (ca && cb) continue;
+        }
 
         uint32_t ia = indices[edge->site_a];
         uint32_t ib = indices[edge->site_b];
@@ -889,60 +949,52 @@ static inline void hpcq_amplitude(const HPCQGraph *g,
         return;
     }
 
-    /* ── 3a: Self-factors (excluding center-center edges) ── */
+    /* ── 3a: Per-layer self-factors (excluding center-center edges) ── */
     double (*sf_re)[2] = (double (*)[2])calloc(n_absorb, 2 * sizeof(double));
     double (*sf_im)[2] = (double (*)[2])calloc(n_absorb, 2 * sizeof(double));
-    double (*so_re)[2] = (double (*)[2])calloc(n_absorb, 2 * sizeof(double)); /* outer q-factor for n_layers=2 */
+    double (*so_re)[2] = (double (*)[2])calloc(n_absorb, 2 * sizeof(double));
     double (*so_im)[2] = (double (*)[2])calloc(n_absorb, 2 * sizeof(double));
     double (*a_cur_re_a)[2] = (double (*)[2])calloc(n_absorb, 2 * sizeof(double));
     double (*a_cur_im_a)[2] = (double (*)[2])calloc(n_absorb, 2 * sizeof(double));
     int *nl_arr = (int *)calloc(n_absorb, sizeof(int));
 
     for (uint64_t a = 0; a < n_absorb; a++) {
-        uint64_t ni = g->absorb[a].n_inner;
         uint64_t nn = g->absorb[a].n_nbrs;
-        nl_arr[a] = (int)g->absorb[a].n_layers;
+        int L = (int)g->absorb[a].n_layers;
+        nl_arr[a] = L;
 
-        /* Inner (y) product over non-center neighbors */
+        /* For each layer ℓ: product over non-center neighbors at this layer.
+         * With n_layers=1: only layer 0 (sf)
+         * With n_layers>=2: layer 0..L-1, with sf for layer 0 and so for layer 1..L-1. */
         double pi_re[2] = {1.0, 1.0}, pi_im[2] = {0.0, 0.0};
-        for (uint64_t k = 0; k < ni; k++) {
+        double po_re[2] = {1.0, 1.0}, po_im[2] = {0.0, 0.0};
+
+        for (uint64_t k = 0; k < nn; k++) {
             uint64_t nb = g->absorb[a].nbrs[k];
-            if (g->absorb_idx[nb] >= 0) continue; /* skip center-center edges — handled in component joint sum */
+            if (g->absorb_idx[nb] >= 0) continue; /* center-center → component sum */
+            int li = (int)g->absorb[a].layer[k];
             int z = (int)indices[nb];
             for (int y = 0; y < 2; y++) {
                 int idx = (int)k * 4 + y * 2 + z;
                 double wr = g->absorb[a].w_re[idx], wi = g->absorb[a].w_im[idx];
-                double pr = pi_re[y], pim = pi_im[y];
-                pi_re[y] = pr * wr - pim * wi;
-                pi_im[y] = pr * wi + pim * wr;
+                double pr = (li == 0) ? pi_re[y] : po_re[y];
+                double pim = (li == 0) ? pi_im[y] : po_im[y];
+                if (li == 0) { pi_re[y] = pr * wr - pim * wi; pi_im[y] = pr * wi + pim * wr; }
+                else { po_re[y] = pr * wr - pim * wi; po_im[y] = pr * wi + pim * wr; }
             }
         }
         for (int y = 0; y < 2; y++) {
             sf_re[a][y] = g->absorb[a].a_re[y] * pi_re[y] - g->absorb[a].a_im[y] * pi_im[y];
             sf_im[a][y] = g->absorb[a].a_re[y] * pi_im[y] + g->absorb[a].a_im[y] * pi_re[y];
         }
-
-        /* Outer (q) factor for n_layers=2 (excluding center-center edges) */
-        if (nl_arr[a] >= 2) {
-            double po_re[2] = {1.0, 1.0}, po_im[2] = {0.0, 0.0};
-            for (uint64_t k = ni; k < nn; k++) {
-                uint64_t nb = g->absorb[a].nbrs[k];
-                if (g->absorb_idx[nb] >= 0) continue; /* center-center edges handled in component joint sum */
-                int z = (int)indices[nb];
-                for (int q = 0; q < 2; q++) {
-                    int idx = (int)k * 4 + q * 2 + z;
-                    double wr = g->absorb[a].w_re[idx], wi = g->absorb[a].w_im[idx];
-                    double pr = po_re[q], pim = po_im[q];
-                    po_re[q] = pr * wr - pim * wi;
-                    po_im[q] = pr * wi + pim * wr;
-                }
-            }
-            so_re[a][0] = po_re[0]; so_im[a][0] = po_im[0];
-            so_re[a][1] = po_re[1]; so_im[a][1] = po_im[1];
-            a_cur_re_a[a][0] = g->absorb[a].a_cur_re[0];
-            a_cur_im_a[a][0] = g->absorb[a].a_cur_im[0];
-            a_cur_re_a[a][1] = g->absorb[a].a_cur_re[1];
-            a_cur_im_a[a][1] = g->absorb[a].a_cur_im[1];
+        so_re[a][0] = po_re[0]; so_im[a][0] = po_im[0];
+        so_re[a][1] = po_re[1]; so_im[a][1] = po_im[1];
+        if (L >= 2) {
+            /* a_cur = a_layer[0] (state before second H) */
+            a_cur_re_a[a][0] = g->absorb[a].a_layer_re[0];
+            a_cur_re_a[a][1] = g->absorb[a].a_layer_re[1];
+            a_cur_im_a[a][0] = g->absorb[a].a_layer_im[0];
+            a_cur_im_a[a][1] = g->absorb[a].a_layer_im[1];
         }
     }
 
@@ -992,62 +1044,78 @@ static inline void hpcq_amplitude(const HPCQGraph *g,
         uint64_t *mems = comp_members[c];
 
         if (sz == 1) {
-            /* Single center — no center-center edges; per-center formula is exact */
+            /* Single center — no other centers; evaluate H-chain directly */
             uint64_t a = mems[0];
-            uint64_t xv = indices[g->absorb[a].center];
-            if (nl_arr[a] >= 2) {
-                /* n_layers=2 */
-                double mid_re[2] = {0,0}, mid_im[2] = {0,0};
-                for (int q = 0; q < 2; q++)
-                    for (int y = 0; y < 2; y++) {
-                        double Hqy = (q == 0) ? SQ : (y == 0 ? SQ : -SQ);
-                        double hr = Hqy * sf_re[a][y], hi = Hqy * sf_im[a][y];
-                        mid_re[q] += hr;
-                        mid_im[q] += hi;
+            uint64_t xv = indices[g->absorb[a].center] ^ g->absorb[a].x_parity;
+            int L = nl_arr[a];
+
+            double cur_re[2] = {sf_re[a][0], sf_re[a][1]};
+            double cur_im[2] = {sf_im[a][0], sf_im[a][1]};
+
+            for (int li = 1; li < L; li++) {
+                double nxt_re[2] = {0,0}, nxt_im[2] = {0,0};
+                /* X parity between layers: Z on the PREVIOUS layer's variable y0 */
+                for (int yi = 0; yi < 2; yi++) {
+                    if (g->absorb[a].layer_x_parity[li-1]) {
+                        if (yi == 1) { cur_re[yi] = -cur_re[yi]; cur_im[yi] = -cur_im[yi]; }
                     }
-                double sum_re = 0, sum_im = 0;
-                for (int q = 0; q < 2; q++) {
-                    double Hxq = (xv == 0) ? SQ : (q == 0 ? SQ : -SQ);
-                    double aq_re = a_cur_re_a[a][q], aq_im = a_cur_im_a[a][q];
-                    double aq_po_re = aq_re * so_re[a][q] - aq_im * so_im[a][q];
-                    double aq_po_im = aq_re * so_im[a][q] + aq_im * so_re[a][q];
-                    double comb_re = aq_po_re * mid_re[q] - aq_po_im * mid_im[q];
-                    double comb_im = aq_po_re * mid_im[q] + aq_po_im * mid_re[q];
-                    sum_re += Hxq * comb_re;
-                    sum_im += Hxq * comb_im;
                 }
-                double new_re = re * sum_re - im * sum_im;
-                double new_im = re * sum_im + im * sum_re;
-                re = new_re; im = new_im;
-            } else {
-                /* n_layers=1 */
-                double sum_re = 0, sum_im = 0;
-                for (int y = 0; y < 2; y++) {
-                    double Hy = (xv == 0) ? SQ : (y == 0 ? SQ : -SQ);
-                    sum_re += Hy * sf_re[a][y];
-                    sum_im += Hy * sf_im[a][y];
+                for (int yo = 0; yo < 2; yo++) {
+                    double sfr = (li == 1) ?
+                        (a_cur_re_a[a][yo] * so_re[a][yo] - a_cur_im_a[a][yo] * so_im[a][yo]) :
+                        so_re[a][yo];
+                    double sfi = (li == 1) ?
+                        (a_cur_re_a[a][yo] * so_im[a][yo] + a_cur_im_a[a][yo] * so_re[a][yo]) :
+                        so_im[a][yo];
+                    for (int yi = 0; yi < 2; yi++) {
+                        double H_yo_yi = (yo == 0) ? SQ : (yi == 0 ? SQ : -SQ);
+                        nxt_re[yo] += H_yo_yi * (sfr * cur_re[yi] - sfi * cur_im[yi]);
+                        nxt_im[yo] += H_yo_yi * (sfr * cur_im[yi] + sfi * cur_re[yi]);
+                    }
                 }
-                double new_re = re * sum_re - im * sum_im;
-                double new_im = re * sum_im + im * sum_re;
-                re = new_re; im = new_im;
+                cur_re[0] = nxt_re[0]; cur_re[1] = nxt_re[1];
+                cur_im[0] = nxt_im[0]; cur_im[1] = nxt_im[1];
             }
+            double sum_re = 0, sum_im = 0;
+            for (int y = 0; y < 2; y++) {
+                double Hxy = (xv == 0) ? SQ : (y == 0 ? SQ : -SQ);
+                sum_re += Hxy * cur_re[y];
+                sum_im += Hxy * cur_im[y];
+            }
+            double new_re = re * sum_re - im * sum_im;
+            double new_im = re * sum_im + im * sum_re;
+            re = new_re; im = new_im;
             continue;
         }
 
-        /* ── Component of size > 1: joint sum over inner variables ──
-         * For each center in the component, count its inner variables:
-         *   n_layers=1 → 1 variable (y)
-         *   n_layers=2 → 2 variables (q, y), with H[q][y] coupling
-         * We set up a bit assignment covering all variables in the component.
-         */
-        /* Compute variable layout: for each member, var_start and var_count */
+        /* sz > 1: Multi-center component exhaustive joint sum over all layers.
+         * Each center i has L_i = nl_arr[mems[i]] variables y_0..y_{L_i-1}.
+         * Total variables = sum(L_i).  Enumerate all 2^total_vars assignments. */
         uint64_t total_vars = 0;
         uint64_t *var_start = (uint64_t *)calloc(sz, sizeof(uint64_t));
         uint64_t *var_count = (uint64_t *)calloc(sz, sizeof(uint64_t));
         for (uint64_t mi = 0; mi < sz; mi++) {
             var_start[mi] = total_vars;
-            var_count[mi] = (nl_arr[mems[mi]] >= 2) ? 2 : 1;
+            var_count[mi] = (uint64_t)nl_arr[mems[mi]];
             total_vars += var_count[mi];
+        }
+
+        /* Collect non-absorbed CZ edges within this component */
+        #define MAX_NA_CE 128
+        uint64_t na_ce_a[MAX_NA_CE], na_ce_b[MAX_NA_CE], n_na_ce = 0;
+        for (uint64_t e = 0; e < g->n_edges && n_na_ce < MAX_NA_CE; e++) {
+            const HPCQEdge *edge = &g->edges[e];
+            if (edge->type != HPCQ_EDGE_CZ) continue;
+            int64_t aia = g->absorb_idx[edge->site_a];
+            int64_t aib = g->absorb_idx[edge->site_b];
+            if (aia < 0 || aib < 0) continue;
+            uint64_t aa = (uint64_t)aia, ab = (uint64_t)aib;
+            if (comp_of[aa] != c || comp_of[ab] != c) continue;
+            if (aa > ab) { uint64_t tmp = aa; aa = ab; ab = tmp; }
+            int dup = 0;
+            for (uint64_t ei = 0; ei < n_na_ce; ei++)
+                if (na_ce_a[ei] == aa && na_ce_b[ei] == ab) { dup = 1; break; }
+            if (!dup) { na_ce_a[n_na_ce] = aa; na_ce_b[n_na_ce] = ab; n_na_ce++; }
         }
 
         double comp_re = 0.0, comp_im = 0.0;
@@ -1055,49 +1123,62 @@ static inline void hpcq_amplitude(const HPCQGraph *g,
         for (uint64_t assign = 0; assign < n_assign; assign++) {
             double term_re = 1.0, term_im = 0.0;
 
-            /* Extract variable values for each center */
-            /* y[mi] = value of inner var, q[mi] = value of outer var (for n_layers=2) */
-            uint64_t y_val[sz], q_val[sz];
+            /* Extract variable values */
+            #define MAX_SZ 8
+            #define MAX_LAYERS 16
+            uint64_t y_val[MAX_SZ][MAX_LAYERS];
             for (uint64_t mi = 0; mi < sz; mi++) {
                 uint64_t vs = var_start[mi];
-                y_val[mi] = (assign >> vs) & 1;
-                if (var_count[mi] == 2)
-                    q_val[mi] = (assign >> (vs + 1)) & 1;
-                else
-                    q_val[mi] = 0; /* not used */
+                uint64_t vc = var_count[mi];
+                for (uint64_t li = 0; li < vc; li++)
+                    y_val[mi][li] = (assign >> (vs + li)) & 1;
             }
 
-            /* Multiply by each center's self-factor and H factor */
+            /* Multiply by each center's H-chain factor and self-factor */
             for (uint64_t mi = 0; mi < sz; mi++) {
                 uint64_t a = mems[mi];
-                uint64_t xv = indices[g->absorb[a].center];
-                uint64_t y = y_val[mi];
-                double sfr = sf_re[a][y], sfi = sf_im[a][y];
+                uint64_t xv = indices[g->absorb[a].center] ^ g->absorb[a].x_parity;
+                int L = nl_arr[a];
 
-                if (var_count[mi] == 2) {
-                    uint64_t q = q_val[mi];
-                    /* Outer: H[xv][q] · a_cur(q) · so(q) */
-                    double Hxq = (xv == 0) ? SQ : (q == 0 ? SQ : -SQ);
-                    double cur_po_re = a_cur_re_a[a][q] * so_re[a][q] - a_cur_im_a[a][q] * so_im[a][q];
-                    double cur_po_im = a_cur_re_a[a][q] * so_im[a][q] + a_cur_im_a[a][q] * so_re[a][q];
-                    /* Inner: H[q][y] */
-                    double Hqy = (q == 0) ? SQ : (y == 0 ? SQ : -SQ);
-                    double factor_re = Hxq * (cur_po_re * (Hqy * sfr) - cur_po_im * (Hqy * sfi));
-                    double factor_im = Hxq * (cur_po_re * (Hqy * sfi) + cur_po_im * (Hqy * sfr));
-                    double new_re = term_re * factor_re - term_im * factor_im;
-                    double new_im = term_re * factor_im + term_im * factor_re;
-                    term_re = new_re; term_im = new_im;
+                double factor_re, factor_im;
+                if (L >= 1) {
+                    factor_re = sf_re[a][y_val[mi][0]];
+                    factor_im = sf_im[a][y_val[mi][0]];
                 } else {
-                    double Hy = (xv == 0) ? SQ : (y == 0 ? SQ : -SQ);
-                    double factor_re = Hy * sfr;
-                    double factor_im = Hy * sfi;
-                    double new_re = term_re * factor_re - term_im * factor_im;
-                    double new_im = term_re * factor_im + term_im * factor_re;
-                    term_re = new_re; term_im = new_im;
+                    factor_re = 1.0; factor_im = 0.0;
                 }
+                for (int li = 1; li < L; li++) {
+                    double H_link = (y_val[mi][li] == 0) ? SQ :
+                                    (y_val[mi][li-1] == 0 ? SQ : -SQ);
+                    /* X parity between layers: Z on the PREVIOUS layer's variable */
+                    if (g->absorb[a].layer_x_parity[li-1]) {
+                        double zf = (y_val[mi][li-1] == 0) ? 1.0 : -1.0;
+                        factor_re *= zf; factor_im *= zf;
+                    }
+                    double sfr, sfi;
+                    if (li == 1) {
+                        sfr = a_cur_re_a[a][y_val[mi][li]] * so_re[a][y_val[mi][li]]
+                            - a_cur_im_a[a][y_val[mi][li]] * so_im[a][y_val[mi][li]];
+                        sfi = a_cur_re_a[a][y_val[mi][li]] * so_im[a][y_val[mi][li]]
+                            + a_cur_im_a[a][y_val[mi][li]] * so_re[a][y_val[mi][li]];
+                    } else {
+                        sfr = so_re[a][y_val[mi][li]];
+                        sfi = so_im[a][y_val[mi][li]];
+                    }
+                    double new_re = factor_re * (H_link * sfr) - factor_im * (H_link * sfi);
+                    double new_im = factor_re * (H_link * sfi) + factor_im * (H_link * sfr);
+                    factor_re = new_re; factor_im = new_im;
+                }
+                if (L >= 1) {
+                    double H_outer = (xv == 0) ? SQ : (y_val[mi][L-1] == 0 ? SQ : -SQ);
+                    factor_re *= H_outer; factor_im *= H_outer;
+                }
+                double new_re = term_re * factor_re - term_im * factor_im;
+                double new_im = term_re * factor_im + term_im * factor_re;
+                term_re = new_re; term_im = new_im;
             }
 
-            /* Multiply by center-center edge weights */
+            /* Center-center absorbed edge weights */
             for (uint64_t mi = 0; mi < sz; mi++) {
                 uint64_t a = mems[mi];
                 for (uint64_t k = 0; k < g->absorb[a].n_nbrs; k++) {
@@ -1110,14 +1191,28 @@ static inline void hpcq_amplitude(const HPCQGraph *g,
                         if (mems[mi2] == aj) break;
                     if (mi2 == sz) continue;
                     if (a >= aj) continue;
-                    uint64_t n_inner = g->absorb[a].n_inner;
-                    uint64_t va = (k < n_inner) ? y_val[mi] : q_val[mi];
-                    uint64_t vb = y_val[mi2];
+                    int li = (int)g->absorb[a].layer[k];
+                    if (li >= (int)var_count[mi] || li >= (int)var_count[mi2]) continue;
+                    uint64_t va = y_val[mi][li];
+                    uint64_t vb = y_val[mi2][li];
                     double wr = ((va * vb) == 0) ? 1.0 : -1.0;
-                    double new_re = term_re * wr;
-                    double new_im = term_im * wr;
-                    term_re = new_re; term_im = new_im;
+                    term_re *= wr; term_im *= wr;
                 }
+            }
+
+            /* Non-absorbed CZ edges within component: outermost layer variables */
+            for (uint64_t ei = 0; ei < n_na_ce; ei++) {
+                uint64_t aa = na_ce_a[ei], ab = na_ce_b[ei];
+                uint64_t mi_a, mi_b;
+                for (mi_a = 0; mi_a < sz && mems[mi_a] != aa; mi_a++);
+                for (mi_b = 0; mi_b < sz && mems[mi_b] != ab; mi_b++);
+                if (mi_a >= sz || mi_b >= sz) continue;
+                int L_a = nl_arr[aa], L_b = nl_arr[ab];
+                if (L_a < 1 || L_b < 1) continue;
+                uint64_t va = y_val[mi_a][L_a - 1];
+                uint64_t vb = y_val[mi_b][L_b - 1];
+                double wr = ((va * vb) == 0) ? 1.0 : -1.0;
+                term_re *= wr; term_im *= wr;
             }
 
             comp_re += term_re;
