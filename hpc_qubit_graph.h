@@ -702,13 +702,22 @@ static inline void hpcq_x(HPCQGraph *g, uint64_t site)
 {
     int64_t ai = g->absorb_idx[site];
     if (ai >= 0) {
-        /* Center qubit: toggle X parity instead of modifying local state.
-         * The center's local state [1,1] represents |+⟩, which is an X eigenstate,
-         * so X on the local state has no effect.  Instead we flip the parity
-         * which will XOR the observed xv in the amplitude calculation. */
+        /* Center qubit: toggle X parity */
         g->absorb[ai].x_parity ^= 1;
     } else {
+        /* Regular site: X and CZ don't commute. When X is applied to a
+         * site with incident CZ edges, the CZ²-X-CZ² sequence creates an
+         * extra Z phase (-1)^x_b on each CZ neighbor b.  Apply Z on each
+         * incident CZ neighbor to account for this. */
         tri_apply_x(&g->locals[site]);
+        for (uint64_t ii = 0; ii < g->inc_counts[site]; ii++) {
+            uint64_t e = g->inc_edges[site][ii];
+            HPCQEdge *edge = &g->edges[e];
+            if (edge->type == HPCQ_EDGE_CZ) {
+                uint64_t nb = (edge->site_a == site) ? edge->site_b : edge->site_a;
+                tri_apply_z(&g->locals[nb], M_PI);
+            }
+        }
     }
     HPCQGateEntry entry = { .type = HPCQ_GATE_LOCAL_X, .site_a = site,
                             .fidelity = 1.0 };
@@ -1056,7 +1065,8 @@ static inline void hpcq_amplitude(const HPCQGraph *g,
                 double nxt_re[2] = {0,0}, nxt_im[2] = {0,0};
                 /* X parity between layers: Z on the PREVIOUS layer's variable y0 */
                 for (int yi = 0; yi < 2; yi++) {
-                    if (g->absorb[a].layer_x_parity[li-1]) {
+                    if (g->absorb[a].layer_x_parity &&
+                        g->absorb[a].layer_x_parity[li-1]) {
                         if (yi == 1) { cur_re[yi] = -cur_re[yi]; cur_im[yi] = -cur_im[yi]; }
                     }
                 }
@@ -1118,15 +1128,14 @@ static inline void hpcq_amplitude(const HPCQGraph *g,
             if (!dup) { na_ce_a[n_na_ce] = aa; na_ce_b[n_na_ce] = ab; n_na_ce++; }
         }
 
+        #define MAX_LAYERS 16
+        uint64_t (*y_val)[MAX_LAYERS] = (uint64_t (*)[MAX_LAYERS])calloc(sz, MAX_LAYERS * sizeof(uint64_t));
         double comp_re = 0.0, comp_im = 0.0;
         uint64_t n_assign = (uint64_t)1 << total_vars;
         for (uint64_t assign = 0; assign < n_assign; assign++) {
             double term_re = 1.0, term_im = 0.0;
 
             /* Extract variable values */
-            #define MAX_SZ 8
-            #define MAX_LAYERS 16
-            uint64_t y_val[MAX_SZ][MAX_LAYERS];
             for (uint64_t mi = 0; mi < sz; mi++) {
                 uint64_t vs = var_start[mi];
                 uint64_t vc = var_count[mi];
@@ -1151,7 +1160,8 @@ static inline void hpcq_amplitude(const HPCQGraph *g,
                     double H_link = (y_val[mi][li] == 0) ? SQ :
                                     (y_val[mi][li-1] == 0 ? SQ : -SQ);
                     /* X parity between layers: Z on the PREVIOUS layer's variable */
-                    if (g->absorb[a].layer_x_parity[li-1]) {
+                    if (g->absorb[a].layer_x_parity &&
+                        g->absorb[a].layer_x_parity[li-1]) {
                         double zf = (y_val[mi][li-1] == 0) ? 1.0 : -1.0;
                         factor_re *= zf; factor_im *= zf;
                     }
@@ -1218,6 +1228,7 @@ static inline void hpcq_amplitude(const HPCQGraph *g,
             comp_re += term_re;
             comp_im += term_im;
         }
+        free(y_val);
 
         free(var_start);
         free(var_count);
