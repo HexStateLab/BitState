@@ -861,6 +861,20 @@ static inline void hpcq_cz(HPCQGraph *g, uint64_t site_a, uint64_t site_b)
     hpcq_log_gate(g, entry);
 }
 
+/* CZ without CZ² cancellation — for continuous rotations where CZ·Rx·CZ ≠ I */
+static inline void hpcq_cz_force(HPCQGraph *g, uint64_t sa, uint64_t sb) {
+    hpcq_grow_edges(g);
+    uint64_t idx = g->n_edges;
+    HPCQEdge *e = &g->edges[idx];
+    memset(e, 0, sizeof(HPCQEdge));
+    e->type = HPCQ_EDGE_CZ;
+    e->site_a = sa; e->site_b = sb;
+    e->fidelity = 1.0;
+    g->n_edges++; g->cz_edges++;
+    hpcq_inc_add(g, sa, idx);
+    hpcq_inc_add(g, sb, idx);
+}
+
 /* ═══════════════════════════════════════════════════════════════════════════════
  * GENERAL 2-SITE GATE — Encoded as weighted phase edge
  *
