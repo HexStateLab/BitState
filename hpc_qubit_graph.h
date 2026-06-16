@@ -865,19 +865,44 @@ static inline void hpcq_amplitude(const HPCQGraph *g,
      * For each absorbed center:
      *   ψ_v(x_v, z_1..z_m) = Σ_y H_{x_v,y} · a_original(y) · Π_k w_k(y, z_k)
      * where w_k(y, z_k) is the y-form edge matrix for neighbor k.
-     * The local state already contributes a'_v(x_v) (post-absorb * diagonal gates).
-     * Total center factor = a'_v(x_v) × ψ_v(x_v, ...). */
+     *
+     * IMPORTANT: When two absorbed centers share an edge, the coupling
+     * should be between their INNER variables (y_i, y_j), not between
+     * an inner variable and an OUTCOME variable (y_i, z_j). The per-center
+     * product below EXCLUDES edges to other absorbed centers; those are
+     * handled via joint pair-wise evaluation in Step 4.
+     */
     static const double SQ = 0.7071067811865475244;
+
+    /* Temporary storage for pair correction (Step 4) — heap allocated */
+    uint64_t *has_center_nbr = (uint64_t *)calloc(g->n_absorb + 1, sizeof(uint64_t));
+    double (*in_re)[2] = (double (*)[2])calloc(g->n_absorb + 1, 2 * sizeof(double));
+    double (*in_im)[2] = (double (*)[2])calloc(g->n_absorb + 1, 2 * sizeof(double));
+    double (*po_re_a)[2] = (double (*)[2])calloc(g->n_absorb + 1, 2 * sizeof(double));
+    double (*po_im_a)[2] = (double (*)[2])calloc(g->n_absorb + 1, 2 * sizeof(double));
+    double (*ac_re_a)[2] = (double (*)[2])calloc(g->n_absorb + 1, 2 * sizeof(double));
+    double (*ac_im_a)[2] = (double (*)[2])calloc(g->n_absorb + 1, 2 * sizeof(double));
+    int *nl = (int *)calloc(g->n_absorb + 1, sizeof(int));
+
     for (uint64_t a = 0; a < g->n_absorb; a++) {
         uint64_t center = g->absorb[a].center;
         int xv = (int)indices[center];
         uint64_t n_inner = g->absorb[a].n_inner;
+        uint64_t n_nbrs = g->absorb[a].n_nbrs;
+
+        /* Check for center neighbors */
+        has_center_nbr[a] = 0;
+        for (uint64_t k = 0; k < n_nbrs; k++)
+            if (g->absorb_idx[g->absorb[a].nbrs[k]] >= 0)
+                { has_center_nbr[a] = 1; break; }
 
         /* Inner product: Π w_k(y, z_k) for y = 0, 1 (k < n_inner) */
         double pi_re[2] = {1.0, 1.0};
         double pi_im[2] = {0.0, 0.0};
         for (uint64_t k = 0; k < n_inner; k++) {
-            int z = (int)indices[g->absorb[a].nbrs[k]];
+            uint64_t nb = g->absorb[a].nbrs[k];
+            if (has_center_nbr[a] && g->absorb_idx[nb] >= 0) continue;
+            int z = (int)indices[nb];
             for (int y = 0; y < 2; y++) {
                 int idx = (int)k * 4 + y * 2 + z;
                 double wr = g->absorb[a].w_re[idx];
@@ -888,74 +913,189 @@ static inline void hpcq_amplitude(const HPCQGraph *g,
             }
         }
 
+        /* Store inner factor a_re[y] · pi[y] for Step 4 */
+        double ar_y[2], ai_y[2];
+        ar_y[0] = g->absorb[a].a_re[0]; ai_y[0] = g->absorb[a].a_im[0];
+        ar_y[1] = g->absorb[a].a_re[1]; ai_y[1] = g->absorb[a].a_im[1];
+        for (int y = 0; y < 2; y++) {
+            in_re[a][y] = ar_y[y] * pi_re[y] - ai_y[y] * pi_im[y];
+            in_im[a][y] = ar_y[y] * pi_im[y] + ai_y[y] * pi_re[y];
+        }
+
+        nl[a] = (int)g->absorb[a].n_layers;
+
         if (g->absorb[a].n_layers >= 2) {
-            /* Outer product: Π w_k(q, z_k) for q = 0, 1 (k >= n_inner) */
-            double po_re[2] = {1.0, 1.0};
-            double po_im[2] = {0.0, 0.0};
-            for (uint64_t k = n_inner; k < g->absorb[a].n_nbrs; k++) {
-                int z = (int)indices[g->absorb[a].nbrs[k]];
+            double po_re_t[2] = {1.0, 1.0};
+            double po_im_t[2] = {0.0, 0.0};
+            for (uint64_t k = n_inner; k < n_nbrs; k++) {
+                uint64_t nb = g->absorb[a].nbrs[k];
+                if (has_center_nbr[a] && g->absorb_idx[nb] >= 0) continue;
+                int z = (int)indices[nb];
                 for (int q = 0; q < 2; q++) {
                     int idx = (int)k * 4 + q * 2 + z;
                     double wr = g->absorb[a].w_re[idx];
                     double wi = g->absorb[a].w_im[idx];
-                    double pr = po_re[q], pim = po_im[q];
-                    po_re[q] = pr * wr - pim * wi;
-                    po_im[q] = pr * wi + pim * wr;
+                    double pr = po_re_t[q], pim = po_im_t[q];
+                    po_re_t[q] = pr * wr - pim * wi;
+                    po_im_t[q] = pr * wi + pim * wr;
                 }
             }
+            po_re_a[a][0] = po_re_t[0]; po_im_a[a][0] = po_im_t[0];
+            po_re_a[a][1] = po_re_t[1]; po_im_a[a][1] = po_im_t[1];
+            ac_re_a[a][0] = g->absorb[a].a_cur_re[0]; ac_im_a[a][0] = g->absorb[a].a_cur_im[0];
+            ac_re_a[a][1] = g->absorb[a].a_cur_re[1]; ac_im_a[a][1] = g->absorb[a].a_cur_im[1];
 
-            /* mid[q] = Σ_y H[q][y] · a_re[y] · pi[y] */
-            double mid_re[2] = {0.0, 0.0}, mid_im[2] = {0.0, 0.0};
-            for (int q = 0; q < 2; q++) {
-                for (int y = 0; y < 2; y++) {
-                    double Hqy = (q == 0) ? SQ : (y == 0 ? SQ : -SQ);
-                    double ar = g->absorb[a].a_re[y];
-                    double ai = g->absorb[a].a_im[y];
-                    double pr = pi_re[y], pim = pi_im[y];
-                    double hr = Hqy * ar, hi = Hqy * ai;
-                    mid_re[q] += hr * pr - hi * pim;
-                    mid_im[q] += hr * pim + hi * pr;
+            if (!has_center_nbr[a]) {
+                double mid_re[2] = {0.0, 0.0}, mid_im[2] = {0.0, 0.0};
+                for (int q = 0; q < 2; q++)
+                    for (int y = 0; y < 2; y++) {
+                        double Hqy = (q == 0) ? SQ : (y == 0 ? SQ : -SQ);
+                        double hr = Hqy * ar_y[y], hi = Hqy * ai_y[y];
+                        mid_re[q] += hr * pi_re[y] - hi * pi_im[y];
+                        mid_im[q] += hr * pi_im[y] + hi * pi_re[y];
+                    }
+                double sum_re = 0.0, sum_im = 0.0;
+                for (int q = 0; q < 2; q++) {
+                    double Hxq = (xv == 0) ? SQ : (q == 0 ? SQ : -SQ);
+                    double cr = g->absorb[a].a_cur_re[q];
+                    double ci = g->absorb[a].a_cur_im[q];
+                    double cpor = cr * po_re_t[q] - ci * po_im_t[q];
+                    double cpoi = cr * po_im_t[q] + ci * po_re_t[q];
+                    double mr = mid_re[q], mi = mid_im[q];
+                    double comb_re = cpor * mr - cpoi * mi;
+                    double comb_im = cpor * mi + cpoi * mr;
+                    sum_re += Hxq * comb_re;
+                    sum_im += Hxq * comb_im;
                 }
+                double new_re = re * sum_re - im * sum_im;
+                double new_im = re * sum_im + im * sum_re;
+                re = new_re; im = new_im;
             }
-
-            /* Σ_q H[xv][q] · a_cur(q) · po(q) · mid[q] */
-            double sum_re = 0.0, sum_im = 0.0;
-            for (int q = 0; q < 2; q++) {
-                double Hxq = (xv == 0) ? SQ : (q == 0 ? SQ : -SQ);
-                double cr = g->absorb[a].a_cur_re[q];
-                double ci = g->absorb[a].a_cur_im[q];
-                double por = po_re[q], poi = po_im[q];
-                double mr = mid_re[q], mi = mid_im[q];
-                double cpor = cr * por - ci * poi;
-                double cpoi = cr * poi + ci * por;
-                double comb_re = cpor * mr - cpoi * mi;
-                double comb_im = cpor * mi + cpoi * mr;
-                sum_re += Hxq * comb_re;
-                sum_im += Hxq * comb_im;
-            }
-            double new_re = re * sum_re - im * sum_im;
-            double new_im = re * sum_im + im * sum_re;
-            re = new_re;
-            im = new_im;
         } else {
-            /* Single-layer: Σ_y H_{xv,y} · a_re(y) · pi(y) */
-            double sum_re = 0.0, sum_im = 0.0;
-            for (int y = 0; y < 2; y++) {
-                double Hy = (xv == 0) ? SQ : (y == 0 ? SQ : -SQ);
-                double ar = g->absorb[a].a_re[y];
-                double ai = g->absorb[a].a_im[y];
-                double pr = pi_re[y], pim = pi_im[y];
-                double hr = Hy * ar, hi = Hy * ai;
-                sum_re += hr * pr - hi * pim;
-                sum_im += hr * pim + hi * pr;
+            po_re_a[a][0] = 1.0; po_im_a[a][0] = 0.0;
+            po_re_a[a][1] = 1.0; po_im_a[a][1] = 0.0;
+            ac_re_a[a][0] = 1.0; ac_im_a[a][0] = 0.0;
+            ac_re_a[a][1] = 1.0; ac_im_a[a][1] = 0.0;
+
+            if (!has_center_nbr[a]) {
+                double sum_re = 0.0, sum_im = 0.0;
+                for (int y = 0; y < 2; y++) {
+                    double Hy = (xv == 0) ? SQ : (y == 0 ? SQ : -SQ);
+                    double hr = Hy * ar_y[y], hi = Hy * ai_y[y];
+                    sum_re += hr * pi_re[y] - hi * pi_im[y];
+                    sum_im += hr * pi_im[y] + hi * pi_re[y];
+                }
+                double new_re = re * sum_re - im * sum_im;
+                double new_im = re * sum_im + im * sum_re;
+                re = new_re; im = new_im;
             }
-            double new_re = re * sum_re - im * sum_im;
-            double new_im = re * sum_im + im * sum_re;
-            re = new_re;
-            im = new_im;
         }
     }
 
+    /* ──────────────────────────────────────────────────────────────────────
+     * Step 4: Center-center pair correction
+     *
+     * When two absorbed centers share an edge, the edge weight must couple
+     * their INNER variables (y_i, y_j). Per-center Step 3 excluded these
+     * edges; here we compute the correct joint factor for each pair.
+     *
+     *   inner[qi][qj] = Σ_{yi,yj} H[qi][yi]·in_i[yi]·H[qj][yj]·in_j[yj]·w_ij(yi,yj)
+     *
+     * For single-layer (n_layers==1):  J = inner[xi][xj]
+     * For multi-layer:  J = Σ_{qi,qj} H[xi][qi]·a_cur_i[qi]·po_i[qi]
+     *                         · H[xj][qj]·a_cur_j[qj]·po_j[qj]·inner[qi][qj]
+     * ────────────────────────────────────────────────────────────────────── */
+    for (uint64_t a = 0; a < g->n_absorb; a++) {
+        if (!has_center_nbr[a]) continue;
+        uint64_t ci = g->absorb[a].center;
+        for (uint64_t k = 0; k < g->absorb[a].n_nbrs; k++) {
+            uint64_t nb = g->absorb[a].nbrs[k];
+            int64_t aj_idx = g->absorb_idx[nb];
+            if (aj_idx < 0 || (uint64_t)aj_idx <= a) continue;
+            uint64_t aj = (uint64_t)aj_idx;
+            uint64_t cj = g->absorb[aj].center;
+
+            double w_re[2][2], w_im[2][2];
+            for (int yi = 0; yi < 2; yi++)
+                for (int yj = 0; yj < 2; yj++) {
+                    int idx = (int)k * 4 + yi * 2 + yj;
+                    w_re[yi][yj] = g->absorb[a].w_re[idx];
+                    w_im[yi][yj] = g->absorb[a].w_im[idx];
+                }
+
+            double inner_re[2][2] = {{0,0},{0,0}}, inner_im[2][2] = {{0,0},{0,0}};
+            for (int qi = 0; qi < 2; qi++)
+                for (int qj = 0; qj < 2; qj++)
+                    for (int yi = 0; yi < 2; yi++) {
+                        double Hqiyi = (qi == 0) ? SQ : (yi == 0 ? SQ : -SQ);
+                        double ir_i = in_re[a][yi], ii_i = in_im[a][yi];
+                        for (int yj = 0; yj < 2; yj++) {
+                            double Hqjyj = (qj == 0) ? SQ : (yj == 0 ? SQ : -SQ);
+                            double ir_j = in_re[aj][yj], ii_j = in_im[aj][yj];
+                            double wr = w_re[yi][yj], wi = w_im[yi][yj];
+                            double p_re = (Hqiyi * ir_i) * (Hqjyj * ir_j)
+                                       - (Hqiyi * ii_i) * (Hqjyj * ii_j);
+                            double p_im = (Hqiyi * ir_i) * (Hqjyj * ii_j)
+                                       + (Hqiyi * ii_i) * (Hqjyj * ir_j);
+                            inner_re[qi][qj] += p_re * wr - p_im * wi;
+                            inner_im[qi][qj] += p_re * wi + p_im * wr;
+                        }
+                    }
+
+            int xi = (int)indices[ci], xj = (int)indices[cj];
+            double sum_re, sum_im;
+            int nli = nl[a], nlj = nl[aj];
+
+            if (nli >= 2 && nlj >= 2) {
+                sum_re = 0.0; sum_im = 0.0;
+                for (int qi = 0; qi < 2; qi++) {
+                    double Hxiqi = (xi == 0) ? SQ : (qi == 0 ? SQ : -SQ);
+                    double co_i_re = ac_re_a[a][qi] * po_re_a[a][qi] - ac_im_a[a][qi] * po_im_a[a][qi];
+                    double co_i_im = ac_re_a[a][qi] * po_im_a[a][qi] + ac_im_a[a][qi] * po_re_a[a][qi];
+                    double v1_re = Hxiqi * co_i_re, v1_im = Hxiqi * co_i_im;
+                    for (int qj = 0; qj < 2; qj++) {
+                        double Hxjqj = (xj == 0) ? SQ : (qj == 0 ? SQ : -SQ);
+                        double co_j_re = ac_re_a[aj][qj] * po_re_a[aj][qj] - ac_im_a[aj][qj] * po_im_a[aj][qj];
+                        double co_j_im = ac_re_a[aj][qj] * po_im_a[aj][qj] + ac_im_a[aj][qj] * po_re_a[aj][qj];
+                        double v2_re = Hxjqj * co_j_re, v2_im = Hxjqj * co_j_im;
+                        double vv_re = v1_re * v2_re - v1_im * v2_im;
+                        double vv_im = v1_re * v2_im + v1_im * v2_re;
+                        double ir = inner_re[qi][qj], ii = inner_im[qi][qj];
+                        sum_re += vv_re * ir - vv_im * ii;
+                        sum_im += vv_re * ii + vv_im * ir;
+                    }
+                }
+            } else if (nli >= 2 && nlj == 1) {
+                sum_re = 0.0; sum_im = 0.0;
+                for (int qi = 0; qi < 2; qi++) {
+                    double Hxiqi = (xi == 0) ? SQ : (qi == 0 ? SQ : -SQ);
+                    double co_i_re = ac_re_a[a][qi] * po_re_a[a][qi] - ac_im_a[a][qi] * po_im_a[a][qi];
+                    double co_i_im = ac_re_a[a][qi] * po_im_a[a][qi] + ac_im_a[a][qi] * po_re_a[a][qi];
+                    sum_re += Hxiqi * (co_i_re * inner_re[qi][xj] - co_i_im * inner_im[qi][xj]);
+                    sum_im += Hxiqi * (co_i_re * inner_im[qi][xj] + co_i_im * inner_re[qi][xj]);
+                }
+            } else if (nli == 1 && nlj >= 2) {
+                sum_re = 0.0; sum_im = 0.0;
+                for (int qj = 0; qj < 2; qj++) {
+                    double Hxjqj = (xj == 0) ? SQ : (qj == 0 ? SQ : -SQ);
+                    double co_j_re = ac_re_a[aj][qj] * po_re_a[aj][qj] - ac_im_a[aj][qj] * po_im_a[aj][qj];
+                    double co_j_im = ac_re_a[aj][qj] * po_im_a[aj][qj] + ac_im_a[aj][qj] * po_re_a[aj][qj];
+                    sum_re += Hxjqj * (co_j_re * inner_re[xi][qj] - co_j_im * inner_im[xi][qj]);
+                    sum_im += Hxjqj * (co_j_re * inner_im[xi][qj] + co_j_im * inner_re[xi][qj]);
+                }
+            } else {
+                sum_re = inner_re[xi][xj];
+                sum_im = inner_im[xi][xj];
+            }
+
+            double new_re = re * sum_re - im * sum_im;
+            double new_im = re * sum_im + im * sum_re;
+            re = new_re; im = new_im;
+        }
+    }
+
+    free(has_center_nbr); free(in_re); free(in_im);
+    free(po_re_a); free(po_im_a); free(ac_re_a); free(ac_im_a); free(nl);
     *out_re = re;
     *out_im = im;
     ((HPCQGraph *)g)->amp_evals++;
