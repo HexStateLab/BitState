@@ -1,5 +1,9 @@
 # BitState — Shor's Factoring Algorithm
 
+# Note
+
+This is a Skeleton, there are two bottlenecks that prevent this from running in Polynomial time which are in this code replaced with placeholders while it is resolved.
+
 A complete implementation of Shor's polynomial-time integer factorisation using the
 [Beauregard QFT adder](https://arxiv.org/abs/quant-ph/0205095) compiled down to BitState's
 Holographic Phase Graph (HPC) primitives: **CZ edges, local Hadamards, and phase rotations**.
