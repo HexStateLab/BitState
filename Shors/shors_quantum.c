@@ -37,11 +37,11 @@ int main(int argc, char **argv){
     int nb=(int)mpz_sizeinbase(N,2);
     int pn=4*nb,tn=nb;
     if(argc>=4)pn=atoi(argv[3]);if(argc>=5)tn=atoi(argv[4]);
-    /* Clamp extreme values that make the 2^tn loop infeasible (>10M iterations).
-     * With batch-absorb the chain depth is O(1), so pn can be much larger. */
     if(tn>16){fprintf(stderr,"warning: capping tn %d→16\n",tn);tn=16;}
     if(pn>24&&argc<4){fprintf(stderr,"warning: capping pn %d→24 (override with argv[3])\n",pn);pn=24;}
-    int tot=pn+tn;
+    int an=tn;  /* aux = same size as target (capped) */
+    int p_off=0, t_off=pn, a_off=pn+tn, tot=pn+tn+an;
+    printf("  registers: period=%d  target=%d  aux=%d  tot=%d\n",pn,tn,an,tot);
 
     mpz_t gg;mpz_init(gg);mpz_gcd(gg,N,a);
     if(mpz_cmp_ui(gg,1)>0){printf("gcd=");mpz_out_str(stdout,10,gg);mpz_clear(gg);return 0;}
@@ -50,41 +50,75 @@ int main(int argc, char **argv){
     HPCQGraph*g=hpcq_create((uint64_t)tot);
     if(!g){printf("OOM\n");return 1;}
 
+    /* Initialize registers */
     for(int i=0;i<pn;i++)hpcq_hadamard(g,i);
-    for(int i=0;i<tn;i++)hpcq_hadamard(g,(uint64_t)(pn+i));
-    hpcq_x(g,(uint64_t)pn);
+    for(int i=0;i<tn;i++)hpcq_hadamard(g,(uint64_t)(t_off+i));
+    hpcq_x(g,(uint64_t)t_off);
 
     mpz_t *ap=(mpz_t*)calloc(pn,sizeof(mpz_t));
     for(int k=0;k<pn;k++)mpz_init(ap[k]);mpz_mod(ap[0],a,N);
     for(int k=1;k<pn;k++){mpz_mul(ap[k],ap[k-1],ap[k-1]);mpz_mod(ap[k],ap[k],N);}
 
+    /* Sparse QFT-based controlled modular multiplication.
+     * target ← target × ap[k]  (out‑of‑place via aux, offset‑swap). */
+    mpz_t Cj,CjN;mpz_inits(Cj,CjN,NULL);
+    /* Pre-build static edges: target→aux CZ (shared across all k) */
+    for(int i=0;i<tn;i++)for(int j=0;j<an;j++)
+        hpcq_cz_force(g,(uint64_t)(t_off+i),(uint64_t)(a_off+j));
     for(int k=0;k<pn;k++){
         if(mpz_cmp_ui(ap[k],1)==0)continue;
-        uint64_t cm=mpz_get_ui(ap[k])&((1ULL<<tn)-1);
-        for(int q=0;q<tn;q++){double ph=2.0*M_PI*(double)(cm*(1ULL<<q)%(1ULL<<tn))/(double)(1ULL<<tn);
-            if(fabs(ph)>1e-12){hpcq_cz_force(g,(uint64_t)k,(uint64_t)(pn+q));hpcq_phase(g,(uint64_t)(pn+q),ph);}}}
-    /* Batch-absorb all CZ edges per target in a single layer — avoids the
-     * O(2^pn) chain blow-up from per-iteration Hadamard absorption. */
-    for(int i=0;i<tn;i++)if(g->inc_counts[pn+i])hpcq_hadamard_absorb(g,(uint64_t)(pn+i));
+        /* ── Sparse AQFT on aux: local H + CZ + phased-Rz (nearby only) ── */
+        for(int i=0;i<an;i++)hpcq_hadamard(g,(uint64_t)(a_off+i));
+        for(int d=1;d<an&&d<=3;d++)for(int i=0;i+d<an;i++){
+            hpcq_phase(g,(uint64_t)(a_off+i+d),M_PI/(double)(1ULL<<d));
+            hpcq_cz(g,(uint64_t)(a_off+i+d),(uint64_t)(a_off+i));}
+        /* ── Controlled additions per target bit j ── */
+        for(int j=0;j<tn;j++){
+            mpz_mul_2exp(Cj,ap[k],(unsigned long)j);mpz_mod(Cj,Cj,N);
+            if(mpz_cmp_ui(Cj,0)==0)continue;
+            for(int q=0;q<an;q++){
+                mpz_mul_2exp(CjN,Cj,(unsigned long)q);
+                double ph=2.0*M_PI*mpz_get_d(CjN)/mpz_get_d(N);
+                if(fabs(ph)<1e-14)continue;
+                hpcq_cz_force(g,(uint64_t)k,(uint64_t)(a_off+q));
+                hpcq_phase(g,(uint64_t)(a_off+q),ph);}}
+        /* ── Sparse AIQFT on aux ── */
+        for(int d=an-1;d>=1;d--)if(d<=3)for(int i=an-1-d;i>=0;i--){
+            hpcq_phase(g,(uint64_t)(a_off+i+d),-M_PI/(double)(1ULL<<d));
+            hpcq_cz(g,(uint64_t)(a_off+i+d),(uint64_t)(a_off+i));}
+        for(int i=an-1;i>=0;i--)hpcq_hadamard(g,(uint64_t)(a_off+i));
+        /* ── Offset-swap target ↔ aux (logical, no physical gates) ── */
+        { int tmp=t_off;t_off=a_off;a_off=tmp; }
+    }
+    mpz_clears(Cj,CjN,NULL);
 
-    printf("N=%dbit pn=%d tn=%d ed=%lu ab=%lu\n",nb,pn,tn,(unsigned long)g->n_edges,(unsigned long)g->n_absorb);
+    /* Batch-absorb all CZ edges on the final target register */
+    for(int i=0;i<tn;i++)if(g->inc_counts[t_off+i])hpcq_hadamard_absorb(g,(uint64_t)(t_off+i));
 
-    /* Whole-register QFT: compute ψ(s) ∀s, FFT → QFT†, find peak. */
-    uint64_t n_states=1ULL<<pn;
-    complex double *amp=malloc((size_t)n_states*sizeof(complex double));
-    if(!amp){fprintf(stderr,"OOM FFT\n");hpcq_destroy(g);return 1;}
+    printf("N=%dbit pn=%d tn=%d ed=%lu ab=%lu\n",nb,pn,tn,
+           (unsigned long)g->n_edges,(unsigned long)g->n_absorb);
+
+    uint64_t measured=0;
+    uint64_t rng_state=0x1234567890abcdefULL^((uint64_t)nb*0x9e3779b97f4a7c15ULL);
+    for(int k=0;k<pn;k++)rng_state^=mpz_get_ui(ap[k])*(0x9e3779b97f4a7c15ULL+(uint64_t)k*0x6c4f3d629U);
+    xs64(&rng_state);
     uint32_t *ix=(uint32_t*)calloc((size_t)tot,sizeof(uint32_t));
-    for(int i=0;i<tn;i++)ix[pn+i]=0;
-    for(uint64_t s=0;s<n_states;s++){
-        for(int i=0;i<pn;i++)ix[i]=(s>>i)&1;
-        double re,im;hpcq_amplitude(g,ix,&re,&im);
-        amp[s]=re+I*im;}
+    for(int k=pn-1;k>=0;k--){
+        double p0=0.0,p1=0.0;
+        for(uint64_t tc=0;tc<(1ULL<<tn);tc++){for(int i=0;i<tn;i++)ix[t_off+i]=(tc>>i)&1;
+            for(int i=0;i<tn;i++)ix[a_off+i]=0;
+            for(int j=0;j<pn;j++)ix[j]=0;
+            double re,im;ix[k]=0;hpcq_amplitude(g,ix,&re,&im);p0+=re*re+im*im;
+            ix[k]=1;hpcq_amplitude(g,ix,&re,&im);p1+=re*re+im*im;}
+        rng_state=xs64(&rng_state);
+        double rv=(double)(rng_state>>11)*0x1.0p-53;
+        int out=(p0+p1>1e-30)?(rv<p1/(p0+p1)):0;
+        if(out){measured|=(1ULL<<k);}
+        for(int q=0;q<tn;q++){hpcq_phase(g,(uint64_t)(t_off+q),M_PI*(double)out);
+                              hpcq_phase(g,(uint64_t)(a_off+q),M_PI*(double)out);}
+        double cr[2]={out?0:1,out?1:0},ci[2]={0,0};tri_init_state(&g->locals[k],VIEW_EDGE,cr,ci);
+        if(out){for(int j=0;j<k;j++){double ph=-2.0*M_PI/(double)(1ULL<<(k-j+1));hpcq_phase(g,(uint64_t)j,ph);}}}
     free(ix);
-    fft(amp,(int)n_states,0);
-    uint64_t measured=0;double best_p=-1.0;
-    for(uint64_t y=0;y<n_states;y++){double p=creal(amp[y])*creal(amp[y])+cimag(amp[y])*cimag(amp[y]);
-        if(p>best_p){best_p=p;measured=y;}}
-    free(amp);
 
     printf("s=%lu  ",(unsigned long)measured);
     uint64_t r=0;
