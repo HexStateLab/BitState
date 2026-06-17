@@ -150,6 +150,7 @@ typedef struct {
     double    a_im[2];
     double   *a_layer_re; /* [max(0, n_layers-1) * 2] — state before layer ℓ (ℓ>=1) */
     double   *a_layer_im;
+    uint64_t  a_layer_re_cap; /* capacity of a_layer_re/im (pairs), 0=not allocated */
     uint8_t   x_parity;   /* number of X gates mod 2 since last H absorption */
     uint8_t  *layer_x_parity; /* [max(0, n_layers-1)] — X parity stored when each layer was created */
 } HPCQAbsorbEntry;
@@ -397,8 +398,13 @@ static inline void hpcq_hadamard_absorb(HPCQGraph *g, uint64_t site)
         if (n_inc == 0) {
             /* No new edges: just record a new H layer */
             int L = old->n_layers;
-            old->a_layer_re = (double *)realloc(old->a_layer_re, (L) * 2 * sizeof(double));
-            old->a_layer_im = (double *)realloc(old->a_layer_im, (L) * 2 * sizeof(double));
+            { uint64_t need=(uint64_t)L;
+              if(old->a_layer_re_cap<need){
+                uint64_t nc=old->a_layer_re_cap?old->a_layer_re_cap*2:4;
+                while(nc<need)nc*=2;
+                old->a_layer_re=(double*)realloc(old->a_layer_re,nc*2*sizeof(double));
+                old->a_layer_im=(double*)realloc(old->a_layer_im,nc*2*sizeof(double));
+                old->a_layer_re_cap=nc; }}
             old->a_layer_re[(L-1)*2] = cur_re[0];
             old->a_layer_re[(L-1)*2+1] = cur_re[1];
             old->a_layer_im[(L-1)*2] = cur_im[0];
@@ -495,8 +501,13 @@ static inline void hpcq_hadamard_absorb(HPCQGraph *g, uint64_t site)
 
         /* Store state before this H as a_layer entry for the new layer */
         int L_new = old->n_layers + 1;  /* old->n_layers is the count BEFORE this re-absorption */
-        old->a_layer_re = (double *)realloc(old->a_layer_re, (L_new - 1) * 2 * sizeof(double));
-        old->a_layer_im = (double *)realloc(old->a_layer_im, (L_new - 1) * 2 * sizeof(double));
+        { uint64_t need=(uint64_t)(L_new-1);
+          if(old->a_layer_re_cap<need){
+            uint64_t nc=old->a_layer_re_cap?old->a_layer_re_cap*2:4;
+            while(nc<need)nc*=2;
+            old->a_layer_re=(double*)realloc(old->a_layer_re,nc*2*sizeof(double));
+            old->a_layer_im=(double*)realloc(old->a_layer_im,nc*2*sizeof(double));
+            old->a_layer_re_cap=nc; }}
         old->a_layer_re[(L_new - 2) * 2] = cur_re[0];
         old->a_layer_re[(L_new - 2) * 2 + 1] = cur_re[1];
         old->a_layer_im[(L_new - 2) * 2] = cur_im[0];
@@ -622,6 +633,7 @@ static inline void hpcq_hadamard_absorb(HPCQGraph *g, uint64_t site)
         g->absorb[ai].n_layers = 1;
         g->absorb[ai].a_layer_re = NULL;
         g->absorb[ai].a_layer_im = NULL;
+        g->absorb[ai].a_layer_re_cap = 0;
         g->absorb[ai].x_parity = 0;
         g->absorb[ai].layer_x_parity = NULL;
         g->absorb_idx[site] = (int64_t)ai;
