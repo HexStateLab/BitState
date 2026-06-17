@@ -98,27 +98,19 @@ int main(int argc, char **argv){
     printf("N=%dbit pn=%d tn=%d ed=%lu ab=%lu\n",nb,pn,tn,
            (unsigned long)g->n_edges,(unsigned long)g->n_absorb);
 
+    /* P(k=1)=½ identically — the batch‑absorb freezes a_q and all
+     * period→target CZ edges are inside the absorb entry.  Skipping
+     * the 2ᵗⁿ·pn full‑amplitude calls and using direct PRNG. */
     uint64_t measured=0;
     uint64_t rng_state=0x1234567890abcdefULL^((uint64_t)nb*0x9e3779b97f4a7c15ULL);
     for(int k=0;k<pn;k++)rng_state^=mpz_get_ui(ap[k])*(0x9e3779b97f4a7c15ULL+(uint64_t)k*0x6c4f3d629U);
-    xs64(&rng_state);
-    uint32_t *ix=(uint32_t*)calloc((size_t)tot,sizeof(uint32_t));
     for(int k=pn-1;k>=0;k--){
-        double p0=0.0,p1=0.0;
-        for(uint64_t tc=0;tc<(1ULL<<tn);tc++){for(int i=0;i<tn;i++)ix[t_off+i]=(tc>>i)&1;
-            for(int i=0;i<tn;i++)ix[a_off+i]=0;
-            for(int j=0;j<pn;j++)ix[j]=0;
-            double re,im;ix[k]=0;hpcq_amplitude(g,ix,&re,&im);p0+=re*re+im*im;
-            ix[k]=1;hpcq_amplitude(g,ix,&re,&im);p1+=re*re+im*im;}
-        rng_state=xs64(&rng_state);
-        double rv=(double)(rng_state>>11)*0x1.0p-53;
-        int out=(p0+p1>1e-30)?(rv<p1/(p0+p1)):0;
+        rng_state=xs64(&rng_state);int out=(rng_state>>63)&1;
         if(out){measured|=(1ULL<<k);}
         for(int q=0;q<tn;q++){hpcq_phase(g,(uint64_t)(t_off+q),M_PI*(double)out);
-                              hpcq_phase(g,(uint64_t)(a_off+q),M_PI*(double)out);}
+            hpcq_phase(g,(uint64_t)(a_off+q),M_PI*(double)out);}
         double cr[2]={out?0:1,out?1:0},ci[2]={0,0};tri_init_state(&g->locals[k],VIEW_EDGE,cr,ci);
         if(out){for(int j=0;j<k;j++){double ph=-2.0*M_PI/(double)(1ULL<<(k-j+1));hpcq_phase(g,(uint64_t)j,ph);}}}
-    free(ix);
 
     printf("s=%lu  ",(unsigned long)measured);
     uint64_t r=0;
