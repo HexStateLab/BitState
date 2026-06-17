@@ -9,51 +9,6 @@ static const double SQ=0.7071067811865475;
 
 /* Topological collapse measurement: P(k) from absorb chain + targets.
  * O(2^tn × L×tn) — no VE, no full-state amplitude evaluation. */
-static int measure_topological(HPCQGraph *g, int k, int pn, int tn, double rv){
-    uint64_t qk=(uint64_t)k;
-    /* Absorb incident CZ edges into period qubit k */
-    hpcq_hadamard_absorb(g,qk);
-    int64_t ai=g->absorb_idx[qk];
-    if(ai<0){double re[2],im[2];tri_get_amplitudes(&g->locals[qk],VIEW_EDGE,re,im);
-        double p0=re[0]*re[0]+im[0]*im[0],p1=re[1]*re[1]+im[1]*im[1];
-        return(p0+p1>1e-30&&rv<p1/(p0+p1))?1:0;}
-
-    int L=g->absorb[ai].n_layers;
-    double p0=0.0,p1=0.0;
-    for(uint64_t tc=0;tc<(1ULL<<tn);tc++){
-        /* 1. Compute absorb chain for xv=0 and xv=1 */
-        double cur_re[2]={g->absorb[ai].a_re[0],g->absorb[ai].a_re[1]};
-        double cur_im[2]={g->absorb[ai].a_im[0],g->absorb[ai].a_im[1]};
-        /* Multiply by layer-0 neighbor weights */
-        for(uint64_t nb=0;nb<g->absorb[ai].n_nbrs;nb++){if(g->absorb[ai].layer[nb]!=0)continue;
-            int z=(tc>>(g->absorb[ai].nbrs[nb]-(uint64_t)pn))&1;/*target index=neighbor-pn*/
-            int idx0=(int)nb*4+z, idx1=idx0+2;
-            double pr0=cur_re[0]*g->absorb[ai].w_re[idx0]-cur_im[0]*g->absorb[ai].w_im[idx0];
-            double pi0=cur_re[0]*g->absorb[ai].w_im[idx0]+cur_im[0]*g->absorb[ai].w_re[idx0];
-            double pr1=cur_re[1]*g->absorb[ai].w_re[idx1]-cur_im[1]*g->absorb[ai].w_im[idx1];
-            double pi1=cur_re[1]*g->absorb[ai].w_im[idx1]+cur_im[1]*g->absorb[ai].w_re[idx1];
-            cur_re[0]=pr0;cur_im[0]=pi0;cur_re[1]=pr1;cur_im[1]=pi1;}
-        /* Outer H to get ψ(xv) */
-        double sum0_re=SQ*cur_re[0]+SQ*cur_re[1],sum0_im=SQ*cur_im[0]+SQ*cur_im[1];
-        double sum1_re=SQ*cur_re[0]-SQ*cur_re[1],sum1_im=SQ*cur_im[0]-SQ*cur_im[1];
-        double lst_re[2],lst_im[2];tri_get_amplitudes(&g->locals[qk],VIEW_EDGE,lst_re,lst_im);
-        double psi0=(sum0_re*lst_re[0]-sum0_im*lst_im[0])+0*(sum0_im*lst_re[0]+sum0_re*lst_im[0]);
-        /* Actually: complex multiply */
-        {double r0=sum0_re,i0=sum0_im,lr=lst_re[0],li=lst_im[0];
-         double r=lr*1? r0*lr-i0*li : /* let me just do the complex mul inline */
-         /* properly compute |psi|^2 */
-         double a_re=sum0_re*lst_re[0]-sum0_im*lst_im[0];
-         double a_im=sum0_re*lst_im[0]+sum0_im*lst_re[0];
-         double b_re=sum1_re*lst_re[1]-sum1_im*lst_im[1];
-         double b_im=sum1_re*lst_im[1]+sum1_im*lst_re[1];
-         p0+=(a_re*a_re+a_im*a_im);
-         p1+=(b_re*b_re+b_im*b_im);}}
-    int outcome=(p0+p1>1e-30&&rv<p1/(p0+p1))?1:0;
-    /* Collapse */
-    double cr[2]={outcome?0.0:1.0,outcome?1.0:0.0},ci[2]={0,0};
-    tri_init_state(&g->locals[qk],VIEW_EDGE,cr,ci);
-    return outcome;
-}
 
 int main(int argc, char **argv){
     setbuf(stdout,NULL);
@@ -93,11 +48,19 @@ int main(int argc, char **argv){
     printf("N=%dbit pn=%d tn=%d ed=%lu ab=%lu\n",nb,pn,tn,(unsigned long)g->n_edges,(unsigned long)g->n_absorb);
 
     uint64_t measured=0;
+    uint32_t*ix=(uint32_t*)calloc((size_t)tot,sizeof(uint32_t));
     for(int k=pn-1;k>=0;k--){
-        double rv=(double)((k*2654435761ULL+measured)%1000000)/1000000.0;
-        int out=measure_topological(g,k,pn,tn,rv);
+        double p0=0.0,p1=0.0;
+        for(uint64_t tc=0;tc<(1ULL<<tn);tc++){for(int i=0;i<tn;i++)ix[pn+i]=(tc>>i)&1;
+            for(int j=0;j<pn;j++)ix[j]=0;
+            double re,im;ix[k]=0;hpcq_amplitude(g,ix,&re,&im);p0+=re*re+im*im;
+            ix[k]=1;hpcq_amplitude(g,ix,&re,&im);p1+=re*re+im*im;}
+        int out=(p0+p1>1e-30)?((double)((k*2654435761ULL+measured)%1000000)/1000000.0<p1/(p0+p1)):0;
         if(out){measured|=(1ULL<<k);
-            for(int j=0;j<k;j++){double ph=-2.0*M_PI/(double)(1ULL<<(k-j+1));hpcq_phase(g,(uint64_t)j,ph);}}}
+            double cr[2]={0,1},ci[2]={0,0};tri_init_state(&g->locals[k],VIEW_EDGE,cr,ci);
+            for(int j=0;j<k;j++){double ph=-2.0*M_PI/(double)(1ULL<<(k-j+1));hpcq_phase(g,(uint64_t)j,ph);}}
+        else{double cr[2]={1,0},ci[2]={0,0};tri_init_state(&g->locals[k],VIEW_EDGE,cr,ci);}}
+    free(ix);
 
     printf("s=%lu  ",(unsigned long)measured);
     uint64_t r=0;
