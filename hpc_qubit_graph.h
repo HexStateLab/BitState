@@ -1764,8 +1764,86 @@ static inline double hpcq_marginal(const HPCQGraph *g,
         }
     }
 
-    /* Product state: no edges touching this site */
+    /* Product state: no edges touching this site (or all edges absorbed) */
     if (n_connected == 0) {
+        /* Absorbed center: use absorb chain for marginal */
+        int64_t ai = g->absorb_idx[site];
+        if (ai >= 0 && g->absorb[ai].n_nbrs > 0) {
+            int L = (int)g->absorb[ai].n_layers;
+            /* L=1 single center: fastest path */
+            double p_total = 0.0, p_val = 0.0;
+            uint64_t nn = g->absorb[ai].n_nbrs;
+            /* Enumerate neighbor configurations (small — just direct neighbors) */
+            uint64_t n_cfgs = 1ULL << nn;
+            uint32_t nbr_vals[32];
+            for (uint64_t cfg = 0; cfg < n_cfgs; cfg++) {
+                double nbr_prob = 1.0;
+                for (uint64_t k = 0; k < nn; k++) {
+                    nbr_vals[k] = (cfg >> k) & 1;
+                    double re[2], im[2];
+                    tri_get_amplitudes(&g->locals[g->absorb[ai].nbrs[k]], VIEW_EDGE, re, im);
+                    nbr_prob *= re[nbr_vals[k]]*re[nbr_vals[k]] + im[nbr_vals[k]]*im[nbr_vals[k]];
+                }
+                /* Compute absorb chain for this neighbor config */
+                double sf_re[2] = {g->absorb[ai].a_re[0], g->absorb[ai].a_re[1]};
+                double sf_im[2] = {g->absorb[ai].a_im[0], g->absorb[ai].a_im[1]};
+                for (uint64_t k = 0; k < nn; k++) {
+                    int idx = (int)k * 4 + nbr_vals[k]; /* w[y=0] at idx+0, w[y=1] at idx+2 */
+                    double wr0 = g->absorb[ai].w_re[idx], wi0 = g->absorb[ai].w_im[idx];
+                    double wr1 = g->absorb[ai].w_re[idx+2], wi1 = g->absorb[ai].w_im[idx+2];
+                    double pr0 = sf_re[0]*wr0 - sf_im[0]*wi0, pi0 = sf_re[0]*wi0 + sf_im[0]*wr0;
+                    double pr1 = sf_re[1]*wr1 - sf_im[1]*wi1, pi1 = sf_re[1]*wi1 + sf_im[1]*wr1;
+                    sf_re[0]=pr0;sf_im[0]=pi0;sf_re[1]=pr1;sf_im[1]=pi1;
+                }
+                /* Outer H to xv */
+                double sum_re = (value==0 ? 0.7071067811865475 : 0.7071067811865475) * sf_re[0]
+                              + (value==0 ? 0.7071067811865475 : -0.7071067811865475) * sf_re[1];
+                double sum_im = (value==0 ? 0.7071067811865475 : 0.7071067811865475) * sf_im[0]
+                              + (value==0 ? 0.7071067811865475 : -0.7071067811865475) * sf_im[1];
+                double p_cfg = (sum_re*sum_re + sum_im*sum_im) * nbr_prob;
+                double lst_re[2], lst_im[2];
+                tri_get_amplitudes(&g->locals[site], VIEW_EDGE, lst_re, lst_im);
+                p_cfg *= lst_re[value]*lst_re[value] + lst_im[value]*lst_im[value];
+                p_total += p_cfg;
+                if (cfg == 0 && value == ((cfg)?1:0)) /* fix: sum all correctly */
+                    /* fall through to sum all configs */;
+            }
+            /* Recompute properly: sum over all configs for both values? 
+             * Actually we need P(value) / P(total). Let's compute both values. */
+            double p_val0 = 0.0, p_val1 = 0.0;
+            for (int vv = 0; vv < 2; vv++) {
+                double psum = 0.0;
+                for (uint64_t cfg = 0; cfg < n_cfgs; cfg++) {
+                    double nbr_prob = 1.0;
+                    for (uint64_t k = 0; k < nn; k++) {
+                        nbr_vals[k] = (cfg >> k) & 1;
+                        double re[2], im[2];
+                        tri_get_amplitudes(&g->locals[g->absorb[ai].nbrs[k]], VIEW_EDGE, re, im);
+                        nbr_prob *= re[nbr_vals[k]]*re[nbr_vals[k]] + im[nbr_vals[k]]*im[nbr_vals[k]];
+                    }
+                    double sf_re[2] = {g->absorb[ai].a_re[0], g->absorb[ai].a_re[1]};
+                    double sf_im[2] = {g->absorb[ai].a_im[0], g->absorb[ai].a_im[1]};
+                    for (uint64_t k = 0; k < nn; k++) {
+                        int idx = (int)k * 4 + nbr_vals[k];
+                        double wr0 = g->absorb[ai].w_re[idx], wi0 = g->absorb[ai].w_im[idx];
+                        double pr0 = sf_re[0]*wr0 - sf_im[0]*wi0, pi0 = sf_re[0]*wi0 + sf_im[0]*wr0;
+                        sf_re[0]=pr0;sf_im[0]=pi0;
+                        double wr1 = g->absorb[ai].w_re[idx+2], wi1 = g->absorb[ai].w_im[idx+2];
+                        double pr1 = sf_re[1]*wr1 - sf_im[1]*wi1, pi1 = sf_re[1]*wi1 + sf_im[1]*wr1;
+                        sf_re[1]=pr1;sf_im[1]=pi1;
+                    }
+                    double H0 = 0.7071067811865475, H1 = (vv==0 ? 0.7071067811865475 : -0.7071067811865475);
+                    double sum_re = H0*sf_re[0] + H1*sf_re[1];
+                    double sum_im = H0*sf_im[0] + H1*sf_im[1];
+                    double lst_re[2], lst_im[2];
+                    tri_get_amplitudes(&g->locals[site], VIEW_EDGE, lst_re, lst_im);
+                    double lst = lst_re[vv]*lst_re[vv] + lst_im[vv]*lst_im[vv];
+                    psum += (sum_re*sum_re + sum_im*sum_im) * nbr_prob * lst;
+                }
+                if (vv == 0) p_val0 = psum; else p_val1 = psum;
+            }
+            if (p_val0 + p_val1 > 1e-30) return (value ? p_val1 : p_val0) / (p_val0 + p_val1);
+        }
         double re_buf[HPCQ_D], im_buf[HPCQ_D];
         tri_get_amplitudes((TrialityQubit *)&g->locals[site], VIEW_EDGE,
                           re_buf, im_buf);
@@ -1802,8 +1880,9 @@ static inline double hpcq_marginal(const HPCQGraph *g,
         }
 
         /* Phase contributions from edges */
-        for (uint64_t e = 0; e < g->n_edges; e++) {
-            uint64_t sa = g->edges[e].site_a;
+    for (uint64_t e = 0; e < g->n_edges; e++) {
+        if (g->edges[e].type == HPCQ_EDGE_ABSORBED) continue;
+        uint64_t sa = g->edges[e].site_a;
             uint64_t sb = g->edges[e].site_b;
 
             uint32_t va = 0, vb = 0;
