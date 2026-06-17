@@ -22,9 +22,8 @@ int main(int argc, char **argv){
     HPCQGraph*g=hpcq_create((uint64_t)tot);
     if(!g){printf("OOM\n");return 1;}
 
-    /* Plain H on period (absorbed at measurement time only) */
-    for(int i=0;i<pn;i++)hpcq_hadamard(g,i);
-    /* Plain H on targets, X=|1> */
+    /* Period: absorb at init (n_nbrs=0). Target: plain H, X=|1> */
+    for(int i=0;i<pn;i++)hpcq_hadamard_absorb(g,i);
     for(int i=0;i<tn;i++)hpcq_hadamard(g,(uint64_t)(pn+i));
     hpcq_x(g,(uint64_t)pn);
 
@@ -32,25 +31,34 @@ int main(int argc, char **argv){
     for(int k=0;k<pn;k++)mpz_init(ap[k]);mpz_mod(ap[0],a,N);
     for(int k=1;k<pn;k++){mpz_mul(ap[k],ap[k-1],ap[k-1]);mpz_mod(ap[k],ap[k],N);}
 
+    /* CRz with absorption on PERIOD (not target!) for exact H·CZ·H */
     for(int k=0;k<pn;k++){
         if(mpz_cmp_ui(ap[k],1)==0)continue;
         for(int i=0;i<tn;i++){hpcq_hadamard(g,(uint64_t)(pn+i));
             for(int j=i+1;j<tn;j++)hpcq_cz_force(g,(uint64_t)(pn+j),(uint64_t)(pn+i));}
         uint64_t cm=mpz_get_ui(ap[k])&((1ULL<<tn)-1);
         for(int q=0;q<tn;q++){double ph=2.0*M_PI*(double)(cm*(1ULL<<q)%(1ULL<<tn))/(double)(1ULL<<tn);
-            if(fabs(ph)>1e-12){hpcq_hadamard(g,(uint64_t)(pn+q));hpcq_cz_force(g,(uint64_t)k,(uint64_t)(pn+q));hpcq_hadamard(g,(uint64_t)(pn+q));hpcq_phase(g,(uint64_t)(pn+q),ph);}}
+            if(fabs(ph)>1e-12){hpcq_hadamard_absorb(g,(uint64_t)k);hpcq_cz_force(g,(uint64_t)k,(uint64_t)(pn+q));hpcq_hadamard_absorb(g,(uint64_t)k);hpcq_phase(g,(uint64_t)(pn+q),ph);}}
         for(int i=tn-1;i>=0;i--){hpcq_hadamard(g,(uint64_t)(pn+i));
             for(int j=i+1;j<tn;j++)hpcq_cz_force(g,(uint64_t)(pn+j),(uint64_t)(pn+i));}}
 
     printf("N=%dbit pn=%d tn=%d ed=%lu ab=%lu\n",nb,pn,tn,(unsigned long)g->n_edges,(unsigned long)g->n_absorb);
 
-    /* Sequential measurement: absorb period qubit k, then hpcq_measure */
+    /* Direct marginal enumeration (O(2^tn) per measurement) */
     uint64_t measured=0;
+    uint32_t*ix=(uint32_t*)calloc((size_t)tot,sizeof(uint32_t));
     for(int k=pn-1;k>=0;k--){
-        hpcq_hadamard_absorb(g,(uint64_t)k);
-        double rv=(double)((k*2654435761ULL+measured)%1000000)/1000000.0;
-        if(hpcq_measure(g,(uint64_t)k,rv)){measured|=(1ULL<<k);
-            for(int j=0;j<k;j++){double ph=-2.0*M_PI/(double)(1ULL<<(k-j+1));hpcq_phase(g,(uint64_t)j,ph);}}}
+        double p0=0.0,p1=0.0;
+        for(uint64_t tc=0;tc<(1ULL<<tn);tc++){for(int i=0;i<tn;i++)ix[pn+i]=(tc>>i)&1;
+            for(int j=0;j<pn;j++)ix[j]=0;
+            double re,im;ix[k]=0;hpcq_amplitude(g,ix,&re,&im);p0+=re*re+im*im;
+            ix[k]=1;hpcq_amplitude(g,ix,&re,&im);p1+=re*re+im*im;}
+        int outcome=(p0+p1>1e-30)?((double)((k*2654435761ULL+measured)%1000000)/1000000.0<p1/(p0+p1)):0;
+        if(outcome){measured|=(1ULL<<k);
+            double cr[2]={0,1},ci[2]={0,0};tri_init_state(&g->locals[k],VIEW_EDGE,cr,ci);
+            for(int j=0;j<k;j++){double ph=-2.0*M_PI/(double)(1ULL<<(k-j+1));hpcq_phase(g,(uint64_t)j,ph);}}
+        else{double cr[2]={1,0},ci[2]={0,0};tri_init_state(&g->locals[k],VIEW_EDGE,cr,ci);}}
+    free(ix);
 
     printf("s=%lu  ",(unsigned long)measured);
     uint64_t r=0;
