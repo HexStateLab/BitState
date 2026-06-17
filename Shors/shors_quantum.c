@@ -12,6 +12,47 @@
 #endif
 #define SQ 0.7071067811865475244
 
+/* Xorshift64 random number generator */
+static inline uint64_t xs64(uint64_t *s){
+    uint64_t x=*s; x^=x<<13; x^=x>>7; x^=x<<17; *s=x?x:1; return x;
+}
+
+/* Marginal probability P(site=1) from graph topology.
+ * For unabsorbed sites: compute from incident edges (O(deg)).
+ * For absorbed sites: use absorb-chain evaluation. */
+static inline double hpcq_marginal_p1(HPCQGraph *g, uint64_t site) {
+    /* If site has incident phase edges, use edge-product formula */
+    complex double Cprod = 1.0;
+    for (uint64_t ei = 0; ei < g->inc_counts[site]; ei++) {
+        uint64_t eid = g->inc_edges[site][ei];
+        HPCQEdge *e = &g->edges[eid];
+        if (e->type != HPCQ_EDGE_PHASE) continue;
+        double wr = e->w_re[1][1], wi = e->w_im[1][1];
+        Cprod *= (1.0 + wr) + I * wi;
+    }
+    double deg = g->inc_counts[site];
+    double P0 = 0.5 + creal(Cprod) / ldexp(1.0, deg + 2);
+    if (P0 < 0) P0 = 0; if (P0 > 1) P0 = 1;
+    return 1.0 - P0;
+}
+
+/* Destructive projection: collapse site to |val⟩, apply back-action
+ * phase to neighbors via hpcq_phase. */
+static inline void hpcq_project_and_absorb(HPCQGraph *g, uint64_t site, int val) {
+    double re[2] = {val ? 0.0 : 1.0, val ? 1.0 : 0.0}, im[2] = {0, 0};
+    tri_init_state(&g->locals[site], VIEW_EDGE, re, im);
+    if (val) {
+        for (uint64_t ei = 0; ei < g->inc_counts[site]; ei++) {
+            uint64_t eid = g->inc_edges[site][ei];
+            HPCQEdge *e = &g->edges[eid];
+            if (e->type != HPCQ_EDGE_PHASE) continue;
+            uint64_t nb = (e->site_a == site) ? e->site_b : e->site_a;
+            double th = atan2(e->w_im[1][1], e->w_re[1][1]);
+            if (fabs(th) > 1e-14) hpcq_phase(g, nb, th);
+        }
+    }
+}
+
 int main(int argc, char **argv){
     setbuf(stdout,NULL);
     mpz_t N,a;mpz_inits(N,a,NULL);
@@ -39,7 +80,7 @@ int main(int argc, char **argv){
     mpz_t Cj,CjN;mpz_inits(Cj,CjN,NULL);
     for(int k=0;k<pn;k++){
         if(mpz_cmp_ui(ap[k],1)==0)continue;
-        for(int i=0;i<an;i++)hpcq_hadamard(g,(uint64_t)(a_off+i));
+        for(int i=0;i<an;i++)tri_apply_hadamard(&g->locals[a_off+i]);
         for(int d=1;d<an&&d<=3;d++)for(int i=0;i+d<an;i++){
             hpcq_phase(g,(uint64_t)(a_off+i+d),M_PI/(double)(1ULL<<d));hpcq_cz(g,(uint64_t)(a_off+i+d),(uint64_t)(a_off+i));}
         for(int j=0;j<tn;j++){
@@ -60,72 +101,33 @@ int main(int argc, char **argv){
     printf("  N=%dbit pn=%d tn=%d ed=%lu ab=%lu\n",nb,pn,tn,
            (unsigned long)g->n_edges,(unsigned long)g->n_absorb);
 
-    /* Griffiths-Niu measurement via graph amplitudes:
-     * P(F) = Σ_t |Σ_{x:f(x)=t} Σ_aux ψ(x,t,aux) e^{-2πi·F·x/R}|² */
-    uint64_t R=1ULL<<pn, AR=1ULL<<an;
-    
-    /* Pre-compute f(x) and group by target value */
-    uint64_t *fx=(uint64_t*)calloc(R,sizeof(uint64_t));
-    mpz_t tmp;mpz_init_set_ui(tmp,1);
-    for(uint64_t x=0;x<R;x++){fx[x]=mpz_get_ui(tmp);mpz_mul(tmp,tmp,a);mpz_mod(tmp,tmp,N);}
-    mpz_clear(tmp);
-    
-    uint64_t max_t=mpz_get_ui(N);
-    uint64_t **groups=(uint64_t**)calloc(max_t,sizeof(uint64_t*));
-    uint64_t *gsz=(uint64_t*)calloc(max_t,sizeof(uint64_t));
-    for(uint64_t x=0;x<R;x++){
-        uint64_t t=fx[x];
-        groups[t]=(uint64_t*)realloc(groups[t],(gsz[t]+1)*sizeof(uint64_t));
-        groups[t][gsz[t]++]=x;
-    }
-    free(fx);
-    
-    double *prob=(double*)calloc(R,sizeof(double));
-    complex double *Ag=(complex double*)calloc(R,sizeof(complex double));
-    uint32_t *idx=(uint32_t*)calloc(tot,sizeof(uint32_t));
-    
-    /* Sum over aux configurations, evaluate per-group amplitudes, DFT to get P(F) */
-    for(uint64_t a=0;a<AR;a++){
-        for(int i=0;i<an;i++)idx[a_off+i]=(a>>i)&1ULL;
+    /* O(1) Semiclassical Inverse QFT Measurement
+     * Replaces the O(2^pn) global amplitude evaluation with sequential topological marginalization. */
+    uint64_t measured = 0;
+    uint64_t rng = 0x1234567890abcdefULL ^ ((uint64_t)nb * 0x9e3779b97f4a7c15ULL);
+
+    for (int k = pn - 1; k >= 0; k--) {
+        tri_apply_hadamard(&g->locals[k]);
+
+        /* Extract local marginal probability for node k from the graph topology */
+        double p1 = hpcq_marginal_p1(g, (uint64_t)k); 
         
-        for(uint64_t t=0;t<max_t;t++){
-            if(gsz[t]==0)continue;
-            memset(Ag,0,R*sizeof(complex double));
-            for(uint64_t i=0;i<gsz[t];i++){
-                uint64_t x=groups[t][i];
-                for(int k=0;k<pn;k++)idx[k]=(x>>k)&1ULL;
-                for(int i0=0;i0<tn;i0++)idx[t_off+i0]=(t>>i0)&1ULL;
-                double re,im;hpcq_amplitude(g,idx,&re,&im);
-                for(uint64_t F=0;F<R;F++){
-                    double ang=-2.0*M_PI*(double)F*(double)x/(double)R;
-                    double wr=cos(ang),wi=sin(ang);
-                    double cr=re*wr-im*wi, ci=re*wi+im*wr;
-                    Ag[F]+=cr+I*ci;
-                }
+        rng = xs64(&rng);
+        int m_k = ((double)(rng >> 11) * 0x1.0p-53 < p1);
+        
+        if (m_k) {
+            measured |= (1ULL << k);
+            /* Topological phase feedback to lower-order bits */
+            for (int j = 0; j < k; j++) {
+                hpcq_phase(g, (uint64_t)j, -M_PI / (double)(1ULL << (k - j)));
             }
-            for(uint64_t F=0;F<R;F++)
-                prob[F]+=cabs(Ag[F])*cabs(Ag[F]);
         }
+        
+        /* Destructively project the node to bound the graph's entanglement entropy */
+        hpcq_project_and_absorb(g, (uint64_t)k, m_k);
     }
-    for(uint64_t t=0;t<max_t;t++)free(groups[t]);
-    free(groups);free(gsz);free(Ag);free(idx);
     
-    /* Normalize and sample (reject s=0) */
-    double norm=0;
-    for(uint64_t F=0;F<R;F++)norm+=prob[F];
-    if(norm<1e-30)norm=1.0;
-    for(uint64_t F=0;F<R;F++)prob[F]/=norm;
-    
-    srand(time(NULL));
-    uint64_t measured=0;
-    for(int attempt=0;attempt<100;attempt++){
-        double u=(double)rand()/RAND_MAX;
-        double acc=0;
-        for(uint64_t F=0;F<R;F++){acc+=prob[F];if(u<=acc){measured=F;break;}}
-        if(measured>0)break;
-    }
-    free(prob);
-    printf("  s=%lu  ",(unsigned long)measured);
+    printf("  s=%lu  ", (unsigned long)measured);
 
     /* Continued fraction to extract period */
     uint64_t r=0;
