@@ -2,10 +2,24 @@
 #include <stdlib.h>
 #include <math.h>
 #include <stdint.h>
+#include <complex.h>
 #include <gmp.h>
 #include "hpc_qubit_graph.h"
 
 static const double SQ=0.7071067811865475;
+
+/* In-place radix-2 FFT. inverse=0 → forward (QFT† sign). */
+static void fft(complex double *x,int n,int inverse){
+    for(int i=1,j=0;i<n;i++){int bit=n>>1;for(;j&bit;bit>>=1)j^=bit;j^=bit;
+        if(i<j){complex double t=x[i];x[i]=x[j];x[j]=t;}}
+    for(int len=2;len<=n;len<<=1){
+        double ang=2.0*M_PI/len*(inverse?1.0:-1.0);
+        complex double wlen=cos(ang)+I*sin(ang);
+        for(int i=0;i<n;i+=len){complex double w=1.0;
+            for(int j=0;j<len/2;j++){complex double u=x[i+j],v=x[i+j+len/2]*w;
+                x[i+j]=u+v;x[i+j+len/2]=u-v;w*=wlen;}}}
+    if(inverse)for(int i=0;i<n;i++)x[i]/=n;
+}
 
 /* xorshift64 PRNG — reasonably fast, non-crypto, replaces LCG so
  * measurement depends on quantum state (seed) not just call order. */
@@ -55,28 +69,22 @@ int main(int argc, char **argv){
 
     printf("N=%dbit pn=%d tn=%d ed=%lu ab=%lu\n",nb,pn,tn,(unsigned long)g->n_edges,(unsigned long)g->n_absorb);
 
-    uint64_t measured=0;
-    /* Seed PRNG with hash of ap[] so different N produce different sequences */
-    uint64_t rng_state=0x1234567890abcdefULL ^ ((uint64_t)nb*0x9e3779b97f4a7c15ULL);
-    for(int k=0;k<pn;k++) rng_state^=mpz_get_ui(ap[k])*(0x9e3779b97f4a7c15ULL+(uint64_t)k*0x6c4f3d629U);
-    xs64(&rng_state); /* one warm-up step */
-    uint32_t*ix=(uint32_t*)calloc((size_t)tot,sizeof(uint32_t));
-    for(int k=pn-1;k>=0;k--){
-        double p0=0.0,p1=0.0;
-        for(uint64_t tc=0;tc<(1ULL<<tn);tc++){for(int i=0;i<tn;i++)ix[pn+i]=(tc>>i)&1;
-            for(int j=0;j<pn;j++)ix[j]=0;
-            double re,im;ix[k]=0;hpcq_amplitude(g,ix,&re,&im);p0+=re*re+im*im;
-            ix[k]=1;hpcq_amplitude(g,ix,&re,&im);p1+=re*re+im*im;}
-        rng_state=xs64(&rng_state);
-        double rv=(double)(rng_state>>11)*0x1.0p-53;
-        int out=(p0+p1>1e-30)?(rv<p1/(p0+p1)):0;
-        if(out){measured|=(1ULL<<k);}
-        /* Topological collapse: resolve CZ edges from period k to each target.
-         * CZ|k,q⟩ = (-1)^{k·q}. With k→out, target gets Z_phase = π·out. */
-        for(int q=0;q<tn;q++)hpcq_phase(g,(uint64_t)(pn+q),M_PI*(double)out);
-        double cr[2]={out?0:1,out?1:0},ci[2]={0,0};tri_init_state(&g->locals[k],VIEW_EDGE,cr,ci);
-        if(out){for(int j=0;j<k;j++){double ph=-2.0*M_PI/(double)(1ULL<<(k-j+1));hpcq_phase(g,(uint64_t)j,ph);}}}
+    /* Whole-register QFT: compute ψ(s) ∀s, FFT → QFT†, find peak. */
+    uint64_t n_states=1ULL<<pn;
+    complex double *amp=malloc((size_t)n_states*sizeof(complex double));
+    if(!amp){fprintf(stderr,"OOM FFT\n");hpcq_destroy(g);return 1;}
+    uint32_t *ix=(uint32_t*)calloc((size_t)tot,sizeof(uint32_t));
+    for(int i=0;i<tn;i++)ix[pn+i]=0;
+    for(uint64_t s=0;s<n_states;s++){
+        for(int i=0;i<pn;i++)ix[i]=(s>>i)&1;
+        double re,im;hpcq_amplitude(g,ix,&re,&im);
+        amp[s]=re+I*im;}
     free(ix);
+    fft(amp,(int)n_states,0);
+    uint64_t measured=0;double best_p=-1.0;
+    for(uint64_t y=0;y<n_states;y++){double p=creal(amp[y])*creal(amp[y])+cimag(amp[y])*cimag(amp[y]);
+        if(p>best_p){best_p=p;measured=y;}}
+    free(amp);
 
     printf("s=%lu  ",(unsigned long)measured);
     uint64_t r=0;
