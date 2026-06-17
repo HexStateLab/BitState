@@ -1356,14 +1356,22 @@ static inline void hpcq_amplitude(const HPCQGraph *g,
 
             #define VE_MAX_VARS 128
             #define VE_MAX_SCOPE 16
-            #define VE_MAX_FACTORS 512
+            #define VE_MAX_VARS 128
+            #define VE_MAX_SCOPE 12
+            #define VE_MAX_NVALS (1 << VE_MAX_SCOPE)
 
-            typedef struct { uint64_t vars[VE_MAX_SCOPE]; int n_vars; int n_vals; double re[1024]; double im[1024]; } VE_F;
-            VE_F *vf = (VE_F *)calloc(VE_MAX_FACTORS, sizeof(VE_F)); int nvf = 0;
+            int ve_max_factors = 4096;
+            typedef struct { uint64_t vars[VE_MAX_SCOPE]; int n_vars; int n_vals; double re[VE_MAX_NVALS]; double im[VE_MAX_NVALS]; } VE_F;
+            VE_F *vf = (VE_F *)calloc(ve_max_factors, sizeof(VE_F)); int nvf = 0;
+            #define VE_CHECK() do { if (nvf >= ve_max_factors) { \
+                ve_max_factors *= 2; \
+                vf = (VE_F *)realloc(vf, ve_max_factors * sizeof(VE_F)); \
+                memset(&vf[nvf], 0, (ve_max_factors - nvf) * sizeof(VE_F)); \
+            } } while(0)
 
             /* Helper: add a 1-variable factor over variable v with values v0, v1 */
             #define ve_add1(v, v0r, v0i, v1r, v1i) do { \
-                VE_F *f = &vf[nvf++]; memset(f,0,sizeof(VE_F)); \
+                VE_CHECK(); VE_F *f = &vf[nvf++]; memset(f,0,sizeof(VE_F)); \
                 f->vars[0]=v; f->n_vars=1; f->n_vals=2; \
                 f->re[0]=(v0r); f->im[0]=(v0i); f->re[1]=(v1r); f->im[1]=(v1i); \
             } while(0)
