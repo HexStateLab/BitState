@@ -94,12 +94,16 @@ retrying with a different base.
 
 ### Scaling Limits
 
-- Edge count grows as `O(tn²·pn)` → fastest at `tn ≤ 8`, practical up to `tn = 12`
-- Measurement marginalises `2ᵗⁿ` target configurations per period qubit → `tn` hard-cap
-  keeps this bounded
+- Edge count grows as `O(an²·pn)` — static `target→aux` edges (`tn·an`) plus
+  per‑`k` period→aux edges and QFT CZ edges. Fastest at `tn ≤ 8`, practical up to `tn = 12`.
+- Measurement marginalises `2ᵗⁿ` target configurations per period qubit →
+  `O(pn · 2ᵗⁿ · E)` total work.  `tn` is hard‑capped at 16 to bound this.
+- **Absorb depth:** only the final target register gets one batch absorb (`L = 1`).
+  Aux and period qubits use local (non‑absorb) Hadamards, so there is no
+  `O(pn)` absorb‑layer blow‑up — the chain depth is constant.
 - Full RSA semiprimes (period `r ≈ N`) need `pn ≥ 2·log₂ N` — infeasible in HPC
-  because the QFT adder depth creates O(pn) absorb layers on aux, exploding the
-  variable-elimination engine
+  because the measurement loop alone would require `O(N² · log N · 2¹⁶)` ≈ `10¹⁵⁵`
+  operations.
 
 ### Key Optimisations (Sparse Beauregard)
 
