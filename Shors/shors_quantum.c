@@ -25,8 +25,8 @@ int main(int argc, char **argv){
     if(argc>=4)pn=atoi(argv[3]);if(argc>=5)tn=atoi(argv[4]);
     /* Clamp extreme values that make the 2^tn loop infeasible (>10M iterations).
      * With batch-absorb the chain depth is O(1), so pn can be much larger. */
-    if(tn>12){fprintf(stderr,"warning: capping tn %d→12 (2^12≈4K iterations per qubit)\n",tn);tn=12;}
-    if(pn>24){fprintf(stderr,"warning: capping pn %d→24\n",pn);pn=24;}
+    if(tn>16){fprintf(stderr,"warning: capping tn %d→16\n",tn);tn=16;}
+    if(pn>24&&argc<4){fprintf(stderr,"warning: capping pn %d→24 (override with argv[3])\n",pn);pn=24;}
     int tot=pn+tn;
 
     mpz_t gg;mpz_init(gg);mpz_gcd(gg,N,a);
