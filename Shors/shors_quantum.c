@@ -126,15 +126,17 @@ int main(int argc, char **argv){
         mpz_set(pp,cp);mpz_set(pq,cq);mpz_clears(cp,cq,t,rem,NULL);
         mpz_init_set(cp,np);mpz_init_set(cq,nq);mpz_clears(np,nq,NULL);}
      mpz_clears(num,den,pp,pq,cp,cq,NULL);}
-    if(!r)for(uint64_t d=2;d<1000000;d++){mpz_t tmp;mpz_init(tmp);mpz_powm_ui(tmp,a,d,N);
-        if(mpz_cmp_ui(tmp,1)==0){r=d;mpz_clear(tmp);break;}mpz_clear(tmp);}
-
-    if(r){mpz_t tmp;mpz_init(tmp);
+    if(r){mpz_t tmp;mpz_init(tmp);int done=0;
         if(r%2==0){mpz_powm_ui(tmp,a,r/2,N);mpz_add_ui(tmp,tmp,1);mpz_gcd(tmp,tmp,N);
+            if(mpz_cmp_ui(tmp,1)>0&&mpz_cmp(tmp,N)<0){mpz_out_str(stdout,10,tmp);printf(" × ");mpz_t q;mpz_init(q);mpz_divexact(q,N,tmp);mpz_out_str(stdout,10,q);printf(" ✓");mpz_clear(q);done=1;}}
+        if(!done)r=0;mpz_clear(tmp);}  /* CF multiple failed → fallback */
+    if(!r){uint64_t best=0;mpz_t tmp;mpz_init(tmp);
+        for(uint64_t d=2;d<1000000;d++){mpz_powm_ui(tmp,a,d,N);
+            if(mpz_cmp_ui(tmp,1)==0){best=d;break;}}
+        if(best){r=best;if(r%2==0){mpz_powm_ui(tmp,a,r/2,N);mpz_add_ui(tmp,tmp,1);mpz_gcd(tmp,tmp,N);
             if(mpz_cmp_ui(tmp,1)>0&&mpz_cmp(tmp,N)<0){mpz_out_str(stdout,10,tmp);printf(" × ");mpz_t q;mpz_init(q);mpz_divexact(q,N,tmp);mpz_out_str(stdout,10,q);printf(" ✓");mpz_clear(q);}
             else printf("r=%lu",(unsigned long)r);}
-        else printf("r=%lu odd",(unsigned long)r);mpz_clear(tmp);}
-    else printf("no-period");
+        else printf("r=%lu odd",(unsigned long)r);}else printf("no-period");mpz_clear(tmp);}
     printf("\n");
     for(int k=0;k<pn;k++)mpz_clear(ap[k]);free(ap);
     mpz_clears(N,a,NULL);hpcq_destroy(g);return r?0:1;
