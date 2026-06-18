@@ -405,6 +405,9 @@ static inline void hpcq_hadamard_absorb(HPCQGraph *g, uint64_t site)
     /* ─── Re-absorption: H gate on an already-absorbed site ─── */
     if (existing_absorb >= 0) {
         HPCQAbsorbEntry *old = &g->absorb[existing_absorb];
+        if (n_inc >= 1) { fprintf(stderr, "DBG reabs: site=%lu old_abs=%d L=%d nbrs=%lu inc=%d edges:", (unsigned long)site, existing_absorb, old->n_layers, (unsigned long)old->n_nbrs, n_inc);
+        for (int _i = 0; _i < n_inc; _i++) { uint64_t eidx = g->inc_edges[site][_i]; HPCQEdge *_e = &g->edges[eidx]; fprintf(stderr, " e%lu(typ=%d sa=%lu sb=%lu)", (unsigned long)eidx, _e->type, (unsigned long)_e->site_a, (unsigned long)_e->site_b); }
+        fprintf(stderr, "\n"); }
         double cur_re[2], cur_im[2];
         tri_get_amplitudes(&g->locals[site], VIEW_EDGE, cur_re, cur_im);
 
@@ -545,6 +548,9 @@ static inline void hpcq_hadamard_absorb(HPCQGraph *g, uint64_t site)
     }
 
     if (n_inc >= 1) {
+        fprintf(stderr, "DBG 1stabs: site=%lu n_inc=%d edges:", (unsigned long)site, n_inc);
+        for (int _i = 0; _i < n_inc; _i++) { uint64_t eidx = g->inc_edges[site][_i]; HPCQEdge *_e = &g->edges[eidx]; fprintf(stderr, " e%lu(typ=%d sa=%lu sb=%lu)", (unsigned long)eidx, _e->type, (unsigned long)_e->site_a, (unsigned long)_e->site_b); }
+        fprintf(stderr, "\n");
         /* Multi-edge absorption (n_inc >= 1) */
         uint64_t *nbrs = (uint64_t *)calloc(n_inc, sizeof(uint64_t));
         double *w_re = (double *)calloc(n_inc * 4, sizeof(double));
@@ -868,6 +874,7 @@ static inline void hpcq_cz(HPCQGraph *g, uint64_t site_a, uint64_t site_b)
     }
 
     /* No existing edge — add new one */
+    fprintf(stderr, "DBG cz_add: edge=%lu site_a=%lu site_b=%lu\n", (unsigned long)g->n_edges, (unsigned long)site_a, (unsigned long)site_b);
     hpcq_grow_edges(g);
 
     uint64_t idx = g->n_edges;
@@ -1009,6 +1016,7 @@ static inline void hpcq_general_2site(HPCQGraph *g, uint64_t site_a,
         }
         e->fidelity = x_fid;
         uint64_t ei=g->n_edges;
+        fprintf(stderr, "DBG gen2site: X-basis edge=%lu site_a=%lu site_b=%lu typ=%d\n", (unsigned long)ei, (unsigned long)site_a, (unsigned long)site_b, e->type);
         hpcq_inc_add(g,site_a,ei);hpcq_inc_add(g,site_b,ei);
         g->n_edges++; g->phase_edges++;
         hpcq_hadamard_absorb(g, site_a);
@@ -1016,6 +1024,7 @@ static inline void hpcq_general_2site(HPCQGraph *g, uint64_t site_a,
         hpcq_update_fidelity_stats(g);
     } else {
         /* Plain Z-basis diagonal (original behaviour) */
+        fprintf(stderr, "DBG gen2site: Z-basis edge=%lu site_a=%lu site_b=%lu\n", (unsigned long)g->n_edges, (unsigned long)site_a, (unsigned long)site_b);
         double fidelity_sum = 0.0; int fidelity_count = 0;
         for (int j=0;j<HPCQ_D;j++) for (int k=0;k<HPCQ_D;k++) {
             int idx = (j*HPCQ_D+k)*HPCQ_D*HPCQ_D + (j*HPCQ_D+k);
@@ -1143,6 +1152,12 @@ static inline void hpcq_amplitude(const HPCQGraph *g,
     /* ── 3a: Per-layer self-factors (excluding center-center edges) ── */
     double (*sf_re)[2] = (double (*)[2])calloc(n_absorb, 2 * sizeof(double));
     double (*sf_im)[2] = (double (*)[2])calloc(n_absorb, 2 * sizeof(double));
+    { uint64_t _na = n_absorb; for (uint64_t _a = 0; _a < _na; _a++) {
+        fprintf(stderr, "DBG abs[%lu]: center=%lu n_nbrs=%lu n_layers=%d nbrs=", (unsigned long)_a,
+            (unsigned long)g->absorb[_a].center, (unsigned long)g->absorb[_a].n_nbrs, (int)g->absorb[_a].n_layers);
+        for (uint64_t _k = 0; _k < g->absorb[_a].n_nbrs; _k++) fprintf(stderr, "%lu(l%d)", (unsigned long)g->absorb[_a].nbrs[_k], (int)g->absorb[_a].layer[_k]);
+        fprintf(stderr, " idx=%ld\n", (long)g->absorb_idx[g->absorb[_a].center]);
+    }}
     double **so_layer_re = (double **)calloc(n_absorb, sizeof(double *));
     double **so_layer_im = (double **)calloc(n_absorb, sizeof(double *));
     double *na_cz_re = (double *)calloc(n_absorb, sizeof(double));
@@ -1240,6 +1255,7 @@ static inline void hpcq_amplitude(const HPCQGraph *g,
     /* Build component member lists */
     uint64_t *comp_size = (uint64_t *)calloc(n_comp + 1, sizeof(uint64_t));
     for (uint64_t a = 0; a < n_absorb; a++) comp_size[comp_of[a]]++;
+    { for (uint64_t _c = 1; _c <= n_comp; _c++) fprintf(stderr, "DBG comp %lu size=%lu\n", (unsigned long)_c, (unsigned long)comp_size[_c]); }
     uint64_t **comp_members = (uint64_t **)calloc(n_comp + 1, sizeof(uint64_t *));
     uint64_t *comp_cursor = (uint64_t *)calloc(n_comp + 1, sizeof(uint64_t));
     for (uint64_t c = 1; c <= n_comp; c++)
@@ -1346,62 +1362,48 @@ static inline void hpcq_amplitude(const HPCQGraph *g,
          * graph one variable at a time.  For a grid with treewidth W = min(R,C),
          * max intermediate factor size is 2^{W} ≪ 2^{total_vars}. */
         double comp_re = 0.0, comp_im = 0.0;
+        { uint64_t _tv = total_vars; if (_tv < 32) fprintf(stderr, "DBG comp c=%lu sz=%lu total_vars=%lu path=%s\n", (unsigned long)c, (unsigned long)sz, (unsigned long)total_vars, total_vars <= 20 ? "exhaustive" : "VE"); }
         if (total_vars <= 20) {
-            /* Small components: fast-path with exhaustive enumeration */
+            /* Small components: fast-path with existing exhaustive enumeration */
             #define MAX_LAYERS 16
             uint64_t (*y_val)[MAX_LAYERS] = (uint64_t (*)[MAX_LAYERS])calloc(sz, MAX_LAYERS * sizeof(uint64_t));
             uint64_t n_assign = (uint64_t)1 << total_vars;
 
-            /* Pre-index cc edges per center per layer, with half-absorbed detection.
-             * Order-matching: the i-th edge to partner nb on center a matches
-             * the i-th edge to a on partner nb.  If the partner has fewer
-             * occurrences, the unmatched entries are half-absorbed — they couple
-             * the inner variable ya[li] to the partner's output variable xv_nb. */
+            /* Pre-index cc edges per center per layer */
+            /* For each center, for each layer, collect cc edge indices */
             typedef struct { int k, mi2, li2; } CCEdge;
-            typedef struct { int k; uint64_t aj; } HalfEdge;
+            int *n_cc_per_layer = (int *)calloc(sz, sizeof(int));
             int max_layer = 0;
             for (uint64_t mi = 0; mi < sz; mi++) {
-                int L2 = nl_arr[mems[mi]];
-                if (L2 > max_layer) max_layer = L2;
+                int L = nl_arr[mems[mi]];
+                if (L > max_layer) max_layer = L;
             }
             CCEdge ***cc_edges = (CCEdge ***)calloc(sz, sizeof(CCEdge **));
-            HalfEdge ***half_edges = (HalfEdge ***)calloc(sz, sizeof(HalfEdge **));
             for (uint64_t mi = 0; mi < sz; mi++) {
-                int L2 = nl_arr[mems[mi]];
-                cc_edges[mi] = (CCEdge **)calloc(L2, sizeof(CCEdge *));
-                half_edges[mi] = (HalfEdge **)calloc(L2, sizeof(HalfEdge *));
+                int L = nl_arr[mems[mi]];
+                cc_edges[mi] = (CCEdge **)calloc(L, sizeof(CCEdge *));
                 uint64_t a = mems[mi];
-                for (int li = 0; li < L2; li++) {
-                    int ncc = 0, nhalf = 0;
+                for (int li = 0; li < L; li++) {
+                    int ncc = 0;
                     for (uint64_t k = 0; k < g->absorb[a].n_nbrs; k++) {
                         if ((int)g->absorb[a].layer[k] != li) continue;
                         uint64_t nb = g->absorb[a].nbrs[k];
                         int64_t aj_idx = g->absorb_idx[nb];
                         if (aj_idx < 0) continue;
                         uint64_t aj = (uint64_t)aj_idx;
+                        if (a >= aj) continue;
                         uint64_t mi2 = 0;
                         for (; mi2 < sz && mems[mi2] != aj; mi2++);
                         if (mi2 == sz) continue;
-                        /* i-th occurrence of nb in a's nbrs (up to and including k) */
-                        int occ_a = 0;
-                        for (uint64_t kk = 0; kk <= k; kk++)
-                            if (g->absorb[a].nbrs[kk] == nb) occ_a++;
-                        /* i-th occurrence of a in partner's nbrs */
-                        int occ_b = 0, lj = -1;
+                        int li2 = -1;
                         for (uint64_t k2 = 0; k2 < g->absorb[aj].n_nbrs; k2++) {
                             if (g->absorb[aj].nbrs[k2] == g->absorb[a].center) {
-                                occ_b++;
-                                if (occ_b == occ_a) {
-                                    lj = (int)g->absorb[aj].layer[k2];
-                                    break;
-                                }
+                                li2 = (int)g->absorb[aj].layer[k2];
+                                break;
                             }
                         }
-                        if (lj >= 0 && lj < (int)var_count[mi2]) {
-                            if (a < aj) ncc++;
-                        } else {
-                            nhalf++;
-                        }
+                        if (li2 < 0 || li2 >= (int)var_count[mi2]) continue;
+                        ncc++;
                     }
                     if (ncc > 0) {
                         cc_edges[mi][li] = (CCEdge *)calloc(ncc + 1, sizeof(CCEdge));
@@ -1416,58 +1418,20 @@ static inline void hpcq_amplitude(const HPCQGraph *g,
                             uint64_t mi2 = 0;
                             for (; mi2 < sz && mems[mi2] != aj; mi2++);
                             if (mi2 == sz) continue;
-                            int occ_a = 0;
-                            for (uint64_t kk = 0; kk <= k; kk++)
-                                if (g->absorb[a].nbrs[kk] == nb) occ_a++;
-                            int occ_b = 0, lj = -1;
+                            int li2 = -1;
                             for (uint64_t k2 = 0; k2 < g->absorb[aj].n_nbrs; k2++) {
                                 if (g->absorb[aj].nbrs[k2] == g->absorb[a].center) {
-                                    occ_b++;
-                                    if (occ_b == occ_a) {
-                                        lj = (int)g->absorb[aj].layer[k2];
-                                        break;
-                                    }
+                                    li2 = (int)g->absorb[aj].layer[k2];
+                                    break;
                                 }
                             }
-                            if (lj >= 0 && lj < (int)var_count[mi2]) {
-                                cc_edges[mi][li][ei].k = (int)k;
-                                cc_edges[mi][li][ei].mi2 = (int)mi2;
-                                cc_edges[mi][li][ei].li2 = lj;
-                                ei++;
-                            }
+                            if (li2 < 0 || li2 >= (int)var_count[mi2]) continue;
+                            cc_edges[mi][li][ei].k = (int)k;
+                            cc_edges[mi][li][ei].mi2 = (int)mi2;
+                            cc_edges[mi][li][ei].li2 = li2;
+                            ei++;
                         }
-                        cc_edges[mi][li][ei].k = -1;
-                    }
-                    if (nhalf > 0) {
-                        half_edges[mi][li] = (HalfEdge *)calloc(nhalf + 1, sizeof(HalfEdge));
-                        int ei = 0;
-                        for (uint64_t k = 0; k < g->absorb[a].n_nbrs; k++) {
-                            if ((int)g->absorb[a].layer[k] != li) continue;
-                            uint64_t nb = g->absorb[a].nbrs[k];
-                            int64_t aj_idx = g->absorb_idx[nb];
-                            if (aj_idx < 0) continue;
-                            uint64_t aj = (uint64_t)aj_idx;
-                            /* Same order-matching check: unmatched = half-absorbed */
-                            int occ_a = 0;
-                            for (uint64_t kk = 0; kk <= k; kk++)
-                                if (g->absorb[a].nbrs[kk] == nb) occ_a++;
-                            int occ_b = 0, lj = -1;
-                            for (uint64_t k2 = 0; k2 < g->absorb[aj].n_nbrs; k2++) {
-                                if (g->absorb[aj].nbrs[k2] == g->absorb[a].center) {
-                                    occ_b++;
-                                    if (occ_b == occ_a) {
-                                        lj = (int)g->absorb[aj].layer[k2];
-                                        break;
-                                    }
-                                }
-                            }
-                            if (lj < 0) {
-                                half_edges[mi][li][ei].k = (int)k;
-                                half_edges[mi][li][ei].aj = aj;
-                                ei++;
-                            }
-                        }
-                        half_edges[mi][li][ei].k = -1;
+                        cc_edges[mi][li][ei].k = -1; // sentinel
                     }
                 }
             }
@@ -1553,25 +1517,6 @@ static inline void hpcq_amplitude(const HPCQGraph *g,
                                 f_re[mi] = nr;
                             }
                         }
-                        /* Half-absorbed edges: inner var → partner xv (output) */
-                        for (uint64_t mi = 0; mi < sz; mi++) {
-                            int L = nl_arr[mems[mi]];
-                            if (li >= L) continue;
-                            if (!half_edges[mi][li]) continue;
-                            uint64_t a = mems[mi];
-                            for (int ei = 0; half_edges[mi][li][ei].k >= 0; ei++) {
-                                int k = half_edges[mi][li][ei].k;
-                                uint64_t aj = half_edges[mi][li][ei].aj;
-                                uint64_t nb = g->absorb[a].nbrs[k];
-                                uint64_t xv_b = indices[nb] ^ g->absorb[aj].x_parity;
-                                int wk_idx = k * 4 + (int)y_val[mi][li] * 2 + (int)xv_b;
-                                double awr = g->absorb[a].w_re[wk_idx];
-                                double awi = g->absorb[a].w_im[wk_idx];
-                                double nr = f_re[mi] * awr - f_im[mi] * awi;
-                                f_im[mi] = f_re[mi] * awi + f_im[mi] * awr;
-                                f_re[mi] = nr;
-                            }
-                        }
                     }
                 }
 
@@ -1609,8 +1554,8 @@ static inline void hpcq_amplitude(const HPCQGraph *g,
                     if (mi_a >= sz || mi_b >= sz) continue;
                     int L_a = nl_arr[aa], L_b = nl_arr[ab];
                     if (L_a < 1 || L_b < 1) continue;
-                    uint64_t va = indices[g->absorb[aa].center] ^ g->absorb[aa].x_parity;
-                    uint64_t vb = indices[g->absorb[ab].center] ^ g->absorb[ab].x_parity;
+                    uint64_t va = (L_a == 1) ? (indices[g->absorb[aa].center] ^ g->absorb[aa].x_parity) : y_val[mi_a][L_a - 1];
+                    uint64_t vb = (L_b == 1) ? (indices[g->absorb[ab].center] ^ g->absorb[ab].x_parity) : y_val[mi_b][L_b - 1];
                     double xp_a = (edge->site_a == g->absorb[aa].center) ? edge->xp_a : edge->xp_b;
                     double xp_b = (edge->site_a == g->absorb[aa].center) ? edge->xp_b : edge->xp_a;
                     double wr = HPCQ_CZ_W(va, vb, xp_a, xp_b);
@@ -1624,15 +1569,11 @@ static inline void hpcq_amplitude(const HPCQGraph *g,
             /* Free cc_edges */
             for (uint64_t mi = 0; mi < sz; mi++) {
                 int L = nl_arr[mems[mi]];
-                for (int li = 0; li < L; li++) {
-                    free(cc_edges[mi][li]);
-                    free(half_edges[mi][li]);
-                }
+                for (int li = 0; li < L; li++) free(cc_edges[mi][li]);
                 free(cc_edges[mi]);
-                free(half_edges[mi]);
             }
             free(cc_edges);
-            free(half_edges);
+            free(n_cc_per_layer);
             free(y_val);
         } else {
             /* Large components: variable elimination using min-degree ordering.
@@ -1641,36 +1582,23 @@ static inline void hpcq_amplitude(const HPCQGraph *g,
 
             #define VE_MAX_VARS 128
             #define VE_MAX_VARS 128
-            #define VE_MAX_SCOPE 24
+            #define VE_MAX_SCOPE 12
+            #define VE_MAX_NVALS (1 << VE_MAX_SCOPE)
 
             int ve_max_factors = 4096;
-            typedef struct { uint64_t vars[VE_MAX_SCOPE]; int n_vars; int n_vals; double *re; double *im; } VE_F;
+            typedef struct { uint64_t vars[VE_MAX_SCOPE]; int n_vars; int n_vals; double re[VE_MAX_NVALS]; double im[VE_MAX_NVALS]; } VE_F;
             VE_F *vf = (VE_F *)calloc(ve_max_factors, sizeof(VE_F)); int nvf = 0;
+            #define VE_CHECK() do { if (nvf >= ve_max_factors) { \
+                ve_max_factors *= 2; \
+                vf = (VE_F *)realloc(vf, ve_max_factors * sizeof(VE_F)); \
+                memset(&vf[nvf], 0, (ve_max_factors - nvf) * sizeof(VE_F)); \
+            } } while(0)
 
-            /* Allocate a fresh factor with nv variables (2^nv entries) */
-            #define ve_alloc(f, nv) do { \
-                (f)->n_vars = (nv); (f)->n_vals = (int)((uint64_t)1 << (nv)); \
-                (f)->re = (double *)calloc((f)->n_vals, sizeof(double)); \
-                (f)->im = (double *)calloc((f)->n_vals, sizeof(double)); \
-            } while(0)
-
-            /* Ensure capacity for nvf+1, allocating a fresh slot */
-            #define VE_CHECK() do { \
-                if (nvf >= ve_max_factors) { \
-                    ve_max_factors *= 2; \
-                    vf = (VE_F *)realloc(vf, ve_max_factors * sizeof(VE_F)); \
-                    memset(&vf[nvf], 0, (ve_max_factors - nvf) * sizeof(VE_F)); \
-                } \
-                vf[nvf].re = NULL; vf[nvf].im = NULL; \
-                nvf++; \
-            } while(0)
-
-            /* Helper: add a 1-variable factor */
+            /* Helper: add a 1-variable factor over variable v with values v0, v1 */
             #define ve_add1(v, v0r, v0i, v1r, v1i) do { \
-                VE_CHECK(); \
-                vf[nvf-1].vars[0] = (v); ve_alloc(&vf[nvf-1], 1); \
-                vf[nvf-1].re[0] = (v0r); vf[nvf-1].im[0] = (v0i); \
-                vf[nvf-1].re[1] = (v1r); vf[nvf-1].im[1] = (v1i); \
+                VE_CHECK(); VE_CHECK(); VE_F *f = &vf[nvf++]; memset(f,0,sizeof(VE_F)); \
+                f->vars[0]=v; f->n_vars=1; f->n_vals=2; \
+                f->re[0]=(v0r); f->im[0]=(v0i); f->re[1]=(v1r); f->im[1]=(v1i); \
             } while(0)
 
             /* Helper: multiply two factors, store in vf[nvf] */
@@ -1691,7 +1619,7 @@ static inline void hpcq_amplitude(const HPCQGraph *g,
                 for (int a2 = 0; a2 < fb->n_vals; a2++) { \
                     uint64_t fb_assign = 0; \
                     for (int k = 0; k < fb->n_vars; k++) \
-                        fb_assign |= (uint64_t)((a2 >> k) & 1) << fb->vars[k]; \
+                        fb_assign |= ((a2 >> k) & 1) << fb->vars[k]; \
                     for (int a1 = 0; a1 < fa->n_vals; a1++) { \
                         int ok = 1; uint64_t fa_assign = 0; \
                         for (int k = 0; k < fa->n_vars; k++) { \
@@ -1739,8 +1667,8 @@ static inline void hpcq_amplitude(const HPCQGraph *g,
                       sr0=ar0*or0-ai0*oi0; si0=ar0*oi0+ai0*or0;
                       sr1=ar1*or1-ai1*oi1; si1=ar1*oi1+ai1*or1; }
                     /* Build 2-variable factor for H[yc][yp] * sf[yc] * Z_parity[yp] */
-                    VE_CHECK(); VE_F *f = &vf[nvf-1]; ve_alloc(f, 2);
-                    f->vars[0] = vp; f->vars[1] = vc;
+                    VE_CHECK(); VE_F *f = &vf[nvf++]; memset(f,0,sizeof(VE_F));
+                    f->vars[0] = vp; f->vars[1] = vc; f->n_vars = 2; f->n_vals = 4;
                     for (int yp = 0; yp < 2; yp++) {
                         for (int yc = 0; yc < 2; yc++) {
                             double H = (yc == 0) ? SQ : (yp == 0 ? SQ : -SQ);
@@ -1779,7 +1707,7 @@ static inline void hpcq_amplitude(const HPCQGraph *g,
                 }
             }
 
-            /* Build absorbed cc edge factors — order-matched + half-absorbed */
+            /* Build absorbed CZ pair factors */
             for (uint64_t mi = 0; mi < sz; mi++) {
                 uint64_t a = mems[mi];
                 for (uint64_t k = 0; k < g->absorb[a].n_nbrs; k++) {
@@ -1787,93 +1715,112 @@ static inline void hpcq_amplitude(const HPCQGraph *g,
                     int64_t aj_idx = g->absorb_idx[nb];
                     if (aj_idx < 0) continue;
                     uint64_t aj = (uint64_t)aj_idx;
-                    int li = (int)g->absorb[a].layer[k];
-                    if (li >= (int)var_count[mi]) continue;
                     uint64_t mi2 = 0;
                     for (; mi2 < sz && mems[mi2] != aj; mi2++);
                     if (mi2 == sz) continue;
-                    /* Order-matching: i-th edge to nb matches i-th edge to a */
-                    int occ_a = 0;
-                    for (uint64_t kk = 0; kk <= k; kk++)
-                        if (g->absorb[a].nbrs[kk] == nb) occ_a++;
-                    int occ_b = 0, lj = -1;
-                    for (uint64_t k2 = 0; k2 < g->absorb[aj].n_nbrs; k2++) {
-                        if (g->absorb[aj].nbrs[k2] == g->absorb[a].center) {
-                            occ_b++;
-                            if (occ_b == occ_a) { lj = (int)g->absorb[aj].layer[k2]; break; }
+                    if (a >= aj) continue;
+                    int li = (int)g->absorb[a].layer[k];
+                    if (li >= (int)var_count[mi] || li >= (int)var_count[mi2]) continue;
+                    uint64_t va = var_start[mi] + li;
+                    uint64_t vb = var_start[mi2] + li;
+                    uint64_t ca = g->absorb[a].center, cb = nb;
+                    double xp_va = 0, xp_vb = 0;
+                    for (uint64_t ee = 0; ee < g->n_edges; ee++) {
+                        const HPCQEdge *ce = &g->edges[ee];
+                        if ((ce->site_a == ca && ce->site_b == cb) || (ce->site_a == cb && ce->site_b == ca)) {
+                            xp_va = (ce->site_a == ca) ? ce->xp_a : ce->xp_b;
+                            xp_vb = (ce->site_a == ca) ? ce->xp_b : ce->xp_a;
+                            break;
                         }
                     }
-                    if (lj >= 0 && lj < (int)var_count[mi2]) {
-                        /* Fully matched cc edge — apply from lower-indexed center */
-                        if (a >= aj) continue;
-                        uint64_t va = var_start[mi] + (uint64_t)li;
-                        uint64_t vb = var_start[mi2] + (uint64_t)lj;
-                        VE_CHECK(); VE_F *f = &vf[nvf-1]; ve_alloc(f, 2);
-                        f->vars[0] = va; f->vars[1] = vb;
-                        for (int ya = 0; ya < 2; ya++)
-                            for (int yb = 0; yb < 2; yb++) {
-                                int wk_idx = (int)k * 4 + ya * 2 + yb;
-                                f->re[ya*2 + yb] = g->absorb[a].w_re[wk_idx];
-                                f->im[ya*2 + yb] = g->absorb[a].w_im[wk_idx];
-                            }
-                    } else {
-                        /* Half-absorbed: couple ya[li] to partner xv */
-                        uint64_t xv_b = indices[nb] ^ g->absorb[aj].x_parity;
-                        uint64_t va = var_start[mi] + (uint64_t)li;
-                        ve_add1(va,
-                            g->absorb[a].w_re[(int)k*4 + 0*2 + (int)xv_b],
-                            g->absorb[a].w_im[(int)k*4 + 0*2 + (int)xv_b],
-                            g->absorb[a].w_re[(int)k*4 + 1*2 + (int)xv_b],
-                            g->absorb[a].w_im[(int)k*4 + 1*2 + (int)xv_b]);
-                    }
+                    VE_CHECK(); VE_F *f = &vf[nvf++]; memset(f,0,sizeof(VE_F));
+                    f->vars[0] = va; f->vars[1] = vb; f->n_vars = 2; f->n_vals = 4;
+                    for (int aa2 = 0; aa2 < 2; aa2++)
+                        for (int bb2 = 0; bb2 < 2; bb2++) {
+                            int idx = aa2 * 2 + bb2;
+                            f->re[idx] = HPCQ_CZ_W(aa2, bb2, xp_va, xp_vb);
+                            f->im[idx] = 0.0;
+                        }
                 }
             }
 
-            /* Build non-absorbed CZ factors — constant (use output xv) */
+            /* Build non-absorbed CZ pair factors (na_ce) */
             for (uint64_t ei = 0; ei < n_na_ce; ei++) {
                 uint64_t aa = na_ce_a[ei], ab = na_ce_b[ei], ee = na_ce_e[ei];
                 const HPCQEdge *edge = &g->edges[ee];
+                uint64_t mi_a, mi_b;
+                for (mi_a = 0; mi_a < sz && mems[mi_a] != aa; mi_a++);
+                for (mi_b = 0; mi_b < sz && mems[mi_b] != ab; mi_b++);
+                if (mi_a >= sz || mi_b >= sz) continue;
+                int L_a = nl_arr[aa], L_b = nl_arr[ab];
+                if (L_a < 1 || L_b < 1) continue;
+                uint64_t va = (L_a == 1) ? (uint64_t)-1 : var_start[mi_a] + L_a - 1;
+                uint64_t vb = (L_b == 1) ? (uint64_t)-1 : var_start[mi_b] + L_b - 1;
                 double xp_a = (edge->site_a == g->absorb[aa].center) ? edge->xp_a : edge->xp_b;
                 double xp_b = (edge->site_a == g->absorb[aa].center) ? edge->xp_b : edge->xp_a;
-                uint64_t va = indices[g->absorb[aa].center] ^ g->absorb[aa].x_parity;
-                uint64_t vb = indices[g->absorb[ab].center] ^ g->absorb[ab].x_parity;
-                double wr = HPCQ_CZ_W(va, vb, xp_a, xp_b);
-                VE_CHECK(); VE_F *f = &vf[nvf-1]; ve_alloc(f, 0);
-                f->re[0] = wr; f->im[0] = 0.0;
+                if (L_a == 1 && L_b == 1) {
+                    /* Both L=1: depends on indices, not inner vars — constant factor */
+                    uint64_t va_fixed = indices[g->absorb[aa].center] ^ g->absorb[aa].x_parity;
+                    uint64_t vb_fixed = indices[g->absorb[ab].center] ^ g->absorb[ab].x_parity;
+                    double wr = HPCQ_CZ_W(va_fixed, vb_fixed, xp_a, xp_b);
+                    VE_CHECK(); VE_F *f = &vf[nvf++]; memset(f,0,sizeof(VE_F));
+                    f->n_vars = 0; f->n_vals = 1;
+                    f->re[0] = wr; f->im[0] = 0.0;
+                } else if (L_a == 1) {
+                    uint64_t va_fixed = indices[g->absorb[aa].center] ^ g->absorb[aa].x_parity;
+                    VE_CHECK(); VE_F *f = &vf[nvf++]; memset(f,0,sizeof(VE_F));
+                    f->vars[0] = vb; f->n_vars = 1; f->n_vals = 2;
+                    for (int b = 0; b < 2; b++) {
+                        f->re[b] = HPCQ_CZ_W(va_fixed, b, xp_a, xp_b);
+                        f->im[b] = 0.0;
+                    }
+                } else if (L_b == 1) {
+                    uint64_t vb_fixed = indices[g->absorb[ab].center] ^ g->absorb[ab].x_parity;
+                    VE_CHECK(); VE_F *f = &vf[nvf++]; memset(f,0,sizeof(VE_F));
+                    f->vars[0] = va; f->n_vars = 1; f->n_vals = 2;
+                    for (int a = 0; a < 2; a++) {
+                        f->re[a] = HPCQ_CZ_W(a, vb_fixed, xp_a, xp_b);
+                        f->im[a] = 0.0;
+                    }
+                } else {
+                    VE_CHECK(); VE_F *f = &vf[nvf++]; memset(f,0,sizeof(VE_F));
+                    f->vars[0] = va; f->vars[1] = vb; f->n_vars = 2; f->n_vals = 4;
+                    for (int aa3 = 0; aa3 < 2; aa3++)
+                        for (int bb3 = 0; bb3 < 2; bb3++) {
+                            int idx = aa3 * 2 + bb3;
+                            f->re[idx] = HPCQ_CZ_W(aa3, bb3, xp_a, xp_b);
+                            f->im[idx] = 0.0;
+                        }
+                }
             }
 
-            /* Interleaved descending elimination: for each center's chain,
-             * eliminate from the last layer downward, round-robin across
-             * centers.  Optimal for chains with cross-couplings (treewidth ≤ 4). */
+            /* Eliminate variables using min-degree ordering */
             int *elim_order = (int *)calloc(total_vars, sizeof(int));
             int *var_active = (int *)calloc(total_vars, sizeof(int));
             for (uint64_t i = 0; i < total_vars; i++) var_active[i] = (int)active[i];
             free(active);
 
-            /* Build interleaved order: for each layer depth (deepest first),
-             * add that layer's variable from each center that has it. */
             int n_elim = 0;
-            int max_layer = 0;
-            for (uint64_t mi = 0; mi < sz; mi++) {
-                int L = nl_arr[mems[mi]];
-                if (L > max_layer) max_layer = L;
-            }
-            for (int depth = max_layer - 1; depth >= 0; depth--) {
-                for (uint64_t mi = 0; mi < sz; mi++) {
-                    int L = nl_arr[mems[mi]];
-                    if (depth < L) {
-                        uint64_t vs = var_start[mi];
-                        int v = (int)(vs + (uint64_t)depth);
-                        if (var_active[v]) {
-                            elim_order[n_elim++] = v;
-                            var_active[v] = 0;
-                        }
+            for (uint64_t i = 0; i < total_vars; i++) {
+                if (!var_active[i]) continue;
+                /* Find variable with minimum factor scope product (min-degree heuristic) */
+                int best_v = -1; uint64_t best_cost = (uint64_t)-1;
+                for (uint64_t v = 0; v < total_vars; v++) {
+                    if (!var_active[v]) continue;
+                    uint64_t cost = 1;
+                    for (int fi = 0; fi < nvf; fi++) {
+                        for (int k = 0; k < vf[fi].n_vars; k++)
+                            if (vf[fi].vars[k] == v) {
+                                cost *= (uint64_t)vf[fi].n_vals;
+                                break;
+                            }
                     }
+                    if (cost < best_cost) { best_cost = cost; best_v = (int)v; }
                 }
-            }
-            /* Eliminate in the pre-computed order */
-            for (int oi = 0; oi < n_elim; oi++) {
-                int v = elim_order[oi];
+                if (best_v < 0) break;
+                elim_order[n_elim++] = best_v;
+                int v = best_v;
+                var_active[v] = 0;
 
                 /* Find all factors containing v, multiply them, sum out v */
                 int first = -1;
@@ -1885,10 +1832,11 @@ static inline void hpcq_amplitude(const HPCQGraph *g,
                     if (first < 0) { first = fi; continue; }
                     /* Multiply vf[fi] into vf[first] */
                     int sav_nvf = nvf;
+                    /* Use temporary factor */
                     VE_F tmp = vf[first];
-                    vf[first].re = NULL; vf[first].im = NULL;
+                    /* Recompute first = tmp * vf[fi] */
                     VE_F *fa = &tmp, *fb = &vf[fi];
-                    VE_F *fc = &vf[first];
+                    VE_F *fc = &vf[first]; memset(fc,0,sizeof(VE_F));
                     int ni=0, ia=0, ib=0;
                     while (ia < fa->n_vars || ib < fb->n_vars) {
                         if (ib>=fb->n_vars || (ia<fa->n_vars && fa->vars[ia]<fb->vars[ib]))
@@ -1897,16 +1845,18 @@ static inline void hpcq_amplitude(const HPCQGraph *g,
                             fc->vars[ni++] = fb->vars[ib++];
                         else { fc->vars[ni++] = fa->vars[ia]; ia++; ib++; }
                     }
-                    ve_alloc(fc, ni);
+                    fc->n_vars = ni; fc->n_vals = 1 << ni;
+                    memset(fc->re, 0, fc->n_vals * sizeof(double));
+                    memset(fc->im, 0, fc->n_vals * sizeof(double));
                     for (int a2 = 0; a2 < fb->n_vals; a2++) {
-                        __uint128_t fb_assign = 0;
+                        uint64_t fb_assign = 0;
                         for (int k = 0; k < fb->n_vars; k++)
-                        fb_assign |= (__uint128_t)((a2 >> k) & 1) << fb->vars[k];
+                            fb_assign |= ((a2 >> k) & 1) << fb->vars[k];
                         for (int a1 = 0; a1 < fa->n_vals; a1++) {
-                            int ok = 1; __uint128_t fa_assign = 0;
+                            int ok = 1; uint64_t fa_assign = 0;
                             for (int k = 0; k < fa->n_vars; k++) {
                                 int bit = (a1 >> k) & 1;
-                                fa_assign |= (__uint128_t)bit << fa->vars[k];
+                                fa_assign |= bit << fa->vars[k];
                                 for (int j = 0; j < fb->n_vars; j++)
                                     if (fa->vars[k] == fb->vars[j]) {
                                         if (bit != ((fb_assign >> fb->vars[j]) & 1)) ok = 0;
@@ -1914,80 +1864,74 @@ static inline void hpcq_amplitude(const HPCQGraph *g,
                                     }
                             }
                             if (!ok) continue;
-                            __uint128_t full = fa_assign | fb_assign;
+                            uint64_t full = fa_assign | fb_assign;
                             uint64_t idx = 0;
                             for (int k = 0; k < ni; k++)
-                                idx |= (int)((full >> fc->vars[k]) & 1) << k;
+                                idx |= ((full >> fc->vars[k]) & 1) << k;
                             fc->re[idx] += fa->re[a1] * fb->re[a2] - fa->im[a1] * fb->im[a2];
                             fc->im[idx] += fa->re[a1] * fb->im[a2] + fa->im[a1] * fb->re[a2];
                         }
                     }
-                    free(tmp.re); free(tmp.im);
-                    free(vf[fi].re); free(vf[fi].im);
+                    /* Mark vf[fi] as inactive by swapping with last */
+                    /* For simplicity, just mark it; we'll compact later if needed */
                     vf[fi].n_vars = 0; /* invalid */
                 }
                 /* Now sum out v from vf[first] */
                 if (first >= 0) {
                     VE_F *f = &vf[first];
+                    VE_F tmp = *f;
                     int pos = -1;
-                    for (int k = 0; k < f->n_vars; k++)
-                        if (f->vars[k] == (uint64_t)v) { pos = k; break; }
+                    for (int k = 0; k < tmp.n_vars; k++)
+                        if (tmp.vars[k] == (uint64_t)v) { pos = k; break; }
                     if (pos >= 0) {
-                        int new_n = f->n_vars - 1;
-                        double *old_re = f->re, *old_im = f->im;
-                        int old_nvars = f->n_vars;
-                        int old_nvals = f->n_vals;
-                        uint64_t old_vars[VE_MAX_SCOPE];
-                        memcpy(old_vars, f->vars, old_nvars * sizeof(uint64_t));
-                        /* Build new vars array */
+                        int new_n = tmp.n_vars - 1;
                         int ni = 0;
-                        for (int k = 0; k < old_nvars; k++)
-                            if (k != pos) f->vars[ni++] = old_vars[k];
+                        for (int k = 0; k < tmp.n_vars; k++)
+                            if (k != pos) f->vars[ni++] = tmp.vars[k];
                         f->n_vars = new_n;
                         f->n_vals = new_n > 0 ? (1 << new_n) : 1;
-                        f->re = (double *)calloc(f->n_vals, sizeof(double));
-                        f->im = (double *)calloc(f->n_vals, sizeof(double));
-                        for (int fi = 0; fi < old_nvals; fi++) {
+                        memset(f->re, 0, f->n_vals * sizeof(double));
+                        memset(f->im, 0, f->n_vals * sizeof(double));
+                        int full_vals = 1 << tmp.n_vars;
+                        for (int fi = 0; fi < full_vals; fi++) {
                             uint64_t out_idx = 0;
-                            for (int k = 0; k < old_nvars; k++) {
+                            for (int k = 0; k < tmp.n_vars; k++) {
                                 if (k == pos) continue;
                                 int bit = (fi >> k) & 1;
                                 int dest = k < pos ? k : k - 1;
                                 out_idx |= bit << dest;
                             }
-                            if (new_n == 0) {
-                                f->re[0] += old_re[fi];
-                                f->im[0] += old_im[fi];
+                            int out_ni = new_n > 0 ? new_n : 1;
+                            if (out_ni == 1) {
+                                f->re[0] += tmp.re[fi];
+                                f->im[0] += tmp.im[fi];
                             } else {
-                                f->re[out_idx] += old_re[fi];
-                                f->im[out_idx] += old_im[fi];
+                                f->re[out_idx] += tmp.re[fi];
+                                f->im[out_idx] += tmp.im[fi];
                             }
                         }
-                        free(old_re); free(old_im);
+                        if (new_n == 0) { f->n_vals = 1; }
                     }
                 }
-                /* Compact: keep only valid factors (with vars or constants) */
+                /* Compact: remove invalid factors (keep constants) */
                 int w = 0;
                 for (int r = 0; r < nvf; r++)
-                    if (vf[r].n_vars > 0 || (vf[r].n_vars == 0 && vf[r].n_vals == 1)) {
+                    if (vf[r].n_vars > 0 || r == first || (vf[r].n_vars == 0 && vf[r].n_vals == 1)) {
                         if (w != r) vf[w] = vf[r];
                         w++;
                     }
                 nvf = w;
-                for (int fi=0;fi<nvf;fi++) {
-                }
             }
             free(elim_order);
             free(var_active);
 
-            /* Multiply all remaining constant factors into the result scalar */
+            /* The result scalar is in the remaining factor(s) */
             comp_re = 1.0; comp_im = 0.0;
             for (int fi = 0; fi < nvf; fi++) {
                 double nr = comp_re * vf[fi].re[0] - comp_im * vf[fi].im[0];
                 double ni = comp_re * vf[fi].im[0] + comp_im * vf[fi].re[0];
                 comp_re = nr; comp_im = ni;
             }
-            for (int fi = 0; fi < nvf; fi++) { free(vf[fi].re); free(vf[fi].im); }
             free(vf);
             #undef ve_add1
             #undef ve_mul
@@ -2308,6 +2252,7 @@ static inline uint32_t hpcq_measure(HPCQGraph *g, uint64_t site,
 static inline double hpcq_norm_sq(const HPCQGraph *g)
 {
     if (g->n_sites > 20) {
+        fprintf(stderr, "hpcq_norm_sq: N=%lu too large\n", g->n_sites);
         return -1.0;
     }
 
