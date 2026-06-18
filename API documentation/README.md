@@ -1,955 +1,827 @@
-# BitState API Reference — D=2 Holographic Phase Graph Engine
+# BitState API Reference
 
-**Version:** D=2 (qubit) adaptation of HexState D=6 architecture  
-**Memory Model:** O(N + E) — never materializes the full 2^N state vector  
-**Dimension:** 2 (each site is a qubit: |0⟩, |1⟩)
+BitState is a quantum circuit simulation engine using a **Holographic Phase Graph (HPC)** representation. States are stored as a graph of per-qubit local amplitudes and per-edge phase weights — memory is `O(N + E)`, never `O(2^N)`.
 
 ---
 
-## Table of Contents
+## Module 1: BigInt (`bigint.h` / `bigint.c`)
 
-1. [Architecture Overview](#1-architecture-overview)
-2. [Data Structures](#2-data-structures)
-    - 2.1 Core State Types (statevector.h)
-    - 2.2 TrialityQubit (qubit_triality.h)
-    - 2.3 FlatQubit (flat_qubit.h)
-    - 2.4 HPC Graph Types (hpc_qubit_graph.h)
-    - 2.5 Sparse Vector Types (hpc_qubit_amplitude.h)
-    - 2.6 QubitEngine Types (qubit_engine.h)
-3. [HPC Graph API](#3-hpc-graph-api)
-    - 3.1 Lifecycle
-    - 3.2 Local Gates
-    - 3.3 Two-Qubit Gates
-    - 3.4 Amplitude & Probability
-    - 3.5 Marginal & Measurement
-    - 3.6 Norm & Entropy
-    - 3.7 Diagnostics
-4. [HPC Sparse Vector & Sampling](#4-hpc-sparse-vector--sampling)
-    - 4.1 Sparse Vector Lifecycle
-    - 4.2 Reconstruction
-    - 4.3 Monte Carlo Expectation
-5. [HPC Bond Contraction](#5-hpc-bond-contraction)
-    - 5.1 Hadamard Fold / Unfold
-    - 5.2 Pauli Decomposition
-    - 5.3 Clifford Edge Encoding
-    - 5.4 2-Site Gate Encoder
-6. [QubitEngine API](#6-qubitengine-api)
-    - 6.1 Lifecycle & Initialization
-    - 6.2 Gates
-    - 6.3 Measurement & Inspection
-    - 6.4 Entanglement
-    - 6.5 Registers
-7. [Qubit Management Primitives](#7-qubit-management-primitives)
-8. [Entanglement Utilities](#8-entanglement-utilities)
-9. [Superposition (DFT₂)](#9-superposition-dft₂)
-10. [Born Rule](#10-born-rule)
-11. [Floating-Point Primitives](#11-floating-point-primitives)
-12. [BigInt Library](#12-bigint-library)
-13. [Example Programs](#13-example-programs)
+4096-bit arbitrary precision integer arithmetic (64 limbs × 64 bits).
 
----
-
-## 1. Architecture Overview
-
-BitState provides **two parallel simulation engines**:
-
-| Engine | File | Approach | Strengths |
-|--------|------|----------|-----------|
-| **HPC Graph** | `hpc_qubit_graph.h` | Phase-graph: state is a product of local amplitudes × edge phases. No state vector. | O(N+E) amplitude queries; scales to thousands of qubits; absorb mechanism handles H gates on entangled qubits |
-| **QubitEngine** | `qubit_engine.h` + `.c` | Pairwise entanglement: each entangled pair is a 4-amplitude JointState (64 bytes). Tracks local qubits + pair bonds. | Full state-vector access on registers; GHZ bulk mode; standard gate set |
-
-Both engines share lower-level modules:
-
-| Module | File | Purpose |
-|--------|------|---------|
-| Triality | `qubit_triality.h/.c` | Three-basis representation (Z/X/Y) with lazy conversion |
-| Flat qubit | `flat_qubit.h` | Two-tier optim. (basis vs full) for single qubits |
-| State vector | `statevector.h` | QubitState (32 B), JointState (64 B) structs |
-| Superposition | `superposition.h` | DFT₂ (Hadamard) on 2 amplitudes |
-| Born rule | `born_rule.h` | Probability & sampling utilities |
-| Entanglement | `entanglement.h` | JointState operations: Bell states, marginals, Schmidt rank |
-| Contract | `hpc_qubit_contract.h` | Pauli decomposition, Clifford edge encoding |
-| Amplitude | `hpc_qubit_amplitude.h` | Sparse state-vector recon and Monte Carlo |
-| Arithmetic | `arithmetic.h` | Fast float ops (inverse sqrt, reciprocal) |
-| BigInt | `bigint.h/.c` | 4096-bit arbitrary-precision arithmetic |
-
----
-
-## 2. Data Structures
-
-### 2.1 Core State Types — `statevector.h`
+### Type
 
 ```c
-/* Single qubit: 2 complex amplitudes = 32 bytes */
-typedef struct {
-    double re[2];   /* Real parts: re[0]=|0⟩, re[1]=|1⟩ */
-    double im[2];   /* Imag parts: im[0]=|0⟩, im[1]=|1⟩ */
-} QubitState;
-
-/* Entangled pair: 4 complex amplitudes = 64 bytes */
-typedef struct {
-    double re[4];   /* Index order: 0=|00⟩, 1=|01⟩, 2=|10⟩, 3=|11⟩ */
-    double im[4];
-} JointState;
-
-/* Generalized amplitude (for registers on large-N states) */
-typedef struct {
-    double re, im;
-    double log2_mag;   /* For states where magnitude underflows double */
-} SV_Amplitude;
-
-/* Stream callback for register state-vector iteration */
-typedef void (*sv_stream_fn)(uint64_t basis_state, SV_Amplitude amp, void *user_data);
-
-SV_Amplitude sv_get_local(const QubitState *s, int k);       /* Get |k⟩ amplitude */
-SV_Amplitude sv_get_joint(const JointState *j, int a, int b); /* Get |ab⟩ amplitude */
+typedef struct { uint64_t limbs[64]; } BigInt;  // little-endian
 ```
 
-### 2.2 TrialityQubit — `qubit_triality.h`
-
-Three mutually-defining views of a single qubit's state:
-
-```c
-typedef enum {
-    VIEW_EDGE      = 0,   /* Z-basis (computational): |0⟩, |1⟩ */
-    VIEW_VERTEX    = 1,   /* X-basis (Hadamard):     |+⟩, |−⟩ */
-    VIEW_DIAGONAL  = 2,   /* Y-basis (S†·H):          |i⟩, |−i⟩ */
-    VIEW_COUNT     = 3
-} TrialityView;
-
-typedef struct {
-    double re[3][2], im[3][2];   /* Amplitudes per view (lazy-computed) */
-    uint8_t dirty[3];            /* 1 = view needs recomputation */
-    TrialityView current_view;   /* Last-written view */
-    uint8_t is_eigenstate;       /* 1 = Pauli eigenstate (O(1) convert) */
-    uint8_t is_real;             /* 1 = all imag parts zero */
-    uint8_t active_mask;         /* Bitmask: bit 0=|0⟩, bit 1=|1⟩ */
-    uint32_t conversions;        /* Total view conversions performed */
-    uint32_t gates_applied;      /* Total gates applied */
-    uint32_t conversion_savings; /* Gates that avoided conversion */
-} TrialityQubit;
-
-/* Lazy evaluation variant (chains H and phase gates without materializing) */
-typedef struct {
-    struct { double phase; } segments[64];
-    uint32_t num_segments;
-    uint32_t dft_count;     /* H count mod 2 (H²=I) */
-    int materialized;
-    double re[2], im[2];    /* Materialized amplitudes */
-} LazyTrialityQubit;
-```
-
-### 2.3 FlatQubit — `flat_qubit.h`
-
-Two-tier optimization: when a qubit is in a known basis state, all gates are O(1).
-
-```c
-typedef enum {
-    FLAT_BASIS   = 0,   /* Single |k⟩ with phase — cheapest ops */
-    QUANTUM_FULL = 1    /* Full 2-amplitude state — general gates */
-} FlatMode;
-
-typedef struct {
-    FlatMode mode;
-    uint8_t  basis_k;       /* FLAT_BASIS: which basis state (0/1) */
-    double   phase_re;      /* FLAT_BASIS: phase factor (unit magnitude) */
-    double   phase_im;
-    double   re[2], im[2];  /* QUANTUM_FULL: amplitudes */
-    uint32_t promotions;    /* Times promoted from basis to full */
-    uint32_t demotions;     /* Times demoted from full to basis */
-} FlatQubit;
-```
-
-### 2.4 HPC Graph Types — `hpc_qubit_graph.h`
-
-```c
-/* ── Edge types ── */
-typedef enum {
-    HPCQ_EDGE_CZ        = 0,   /* Exact CZ: w(a,b)=(-1)^(a·b), fidelity=1.0 */
-    HPCQ_EDGE_PHASE     = 1,   /* General 2×2 phase matrix */
-    HPCQ_EDGE_CLIFFORD  = 2,   /* Clifford-projected (from Pauli decomp.) */
-    HPCQ_EDGE_ABSORBED  = 3    /* Consumed by multi-edge H absorption */
-} HPCQEdgeType;
-
-/* ── A single weighted edge between two sites ── */
-typedef struct {
-    HPCQEdgeType type;
-    uint64_t site_a, site_b;
-    double w_re[2][2], w_im[2][2];   /* 2×2 complex phase matrix */
-    uint8_t pauli_channel;            /* For Clifford edges: 0=I,1=Z,2=X,3=Y */
-    double fidelity;                  /* 1.0 = lossless */
-} HPCQEdge;
-
-/* ── Absorb entry: H-gate absorption of incident edges ── */
-typedef struct {
-    uint64_t center;            /* Site where H was applied */
-    uint64_t n_nbrs;            /* Total neighbors in this entry */
-    uint64_t n_inner;           /* First n_inner are inner group (first H) */
-    uint64_t *nbrs;             /* Neighbor site indices */
-    double *w_re, *w_im;        /* Edge matrices [n_nbrs * 4] */
-    double a_re[2], a_im[2];    /* Local amplitude at FIRST absorption */
-    int n_layers;               /* 1 or 2 (re-absorption count) */
-    double a_cur_re[2], a_cur_im[2];  /* pre-H state for second layer */
-} HPCQAbsorbEntry;
-
-/* ── The graph: state = graph + local sites ── */
-typedef struct {
-    uint64_t n_sites;
-    TrialityQubit *locals;       /* Per-site local states */
-    uint64_t n_edges, edge_cap;
-    HPCQEdge *edges;
-    uint64_t n_absorb, absorb_cap;
-    HPCQAbsorbEntry *absorb;    /* Absorbed H entries */
-    uint64_t n_log, log_cap;
-    HPCQGateEntry *gate_log;    /* Full gate history */
-    uint64_t *inc_counts;        /* Per-site incident edge count */
-    uint64_t *inc_cap;
-    uint64_t **inc_edges;        /* Per-site incident edge lists */
-    int64_t *absorb_idx;         /* Per-site absorb index (-1=none) */
-    /* Statistics */
-    uint64_t amp_evals, prob_evals, measurements;
-    uint64_t cz_edges, phase_edges, clifford_edges;
-    double min_fidelity, avg_fidelity;
-} HPCQGraph;
-```
-
-### 2.5 Sparse Vector Types — `hpc_qubit_amplitude.h`
-
-```c
-typedef struct {
-    uint32_t *indices;   /* Basis state (0/1 per site) */
-    double re, im;       /* Complex amplitude */
-    double prob;         /* = re²+im² */
-} HPCQSparseEntry;
-
-typedef struct {
-    HPCQSparseEntry *entries;
-    uint64_t count, capacity;
-    uint64_t n_sites;
-    double total_prob;   /* Σ prob across all entries */
-    double threshold;    /* Minimum prob for inclusion */
-} HPCQSparseVector;
-
-/* Observable callback for Monte Carlo */
-typedef double (*HPCQObservable)(const uint32_t *indices,
-                                  uint64_t n_sites, void *ctx);
-```
-
-### 2.6 QubitEngine Types — `qubit_engine.h`
-
-```c
-#define MAX_QUBITS     262144   /* 256K qubits */
-#define MAX_PAIRS      262144   /* 256K entangled pairs */
-#define MAX_REGISTERS  16384    /* 16K registers */
-typedef uint64_t basis_t;       /* up to 64 qubits natively */
-
-typedef struct {
-    QubitState state;          /* 32 bytes: 2 complex amplitudes */
-    int32_t pair_id;           /* Index into pairs[] (-1 if not entangled) */
-    int32_t pair_side;         /* 0=A, 1=B */
-    uint32_t id;
-} Qubit;
-
-typedef struct {
-    JointState joint;          /* 64 bytes: 4 complex amplitudes */
-    uint32_t id_a, id_b;       /* Two qubit IDs */
-    uint8_t active;
-} QubitPair;
-
-typedef struct {
-    uint64_t chunk_id;
-    uint64_t n_qubits;
-    uint32_t dim;               /* Always 2 for qubits */
-    uint8_t collapsed;
-    uint32_t collapse_outcome;
-    uint64_t magic_base;
-    uint8_t bulk_rule;          /* 0=general, 1=GHZ, 2=circuit */
-    RegisterEntry entries[4096];
-    uint32_t num_nonzero;
-    /* GHZ/circuit mode metadata: */
-    uint16_t gauss_n_dft, gauss_n_cz;
-    uint8_t gauss_ready;
-    uint16_t gauss_cz_a[256], gauss_cz_b[256];
-} QubitRegister;
-
-typedef struct {
-    Qubit qubits[MAX_QUBITS];
-    QubitPair pairs[MAX_PAIRS];
-    QubitRegister registers[MAX_REGISTERS];
-    uint32_t num_qubits, num_pairs, num_registers;
-    uint64_t rng_state;          /* LCG PRNG state */
-} QubitEngine;
-
-/* Inspection result: probabilities, entropy, purity, Schmidt rank */
-typedef struct {
-    double prob[2];
-    double entropy;
-    double purity;
-    int schmidt_rank;
-} QubitInspect;
-```
-
----
-
-## 3. HPC Graph API — `hpc_qubit_graph.h`
-
-### 3.1 Lifecycle
-
-```c
-/* ── Create a new HPC graph with n_sites (all initialized to |0⟩) ── */
-HPCQGraph *hpcq_create(uint64_t n_sites);
-
-/* ── Destroy graph and free all memory ── */
-void hpcq_destroy(HPCQGraph *g);
-```
-
-**Constants:**
-| Macro | Value | Description |
-|-------|-------|-------------|
-| `HPCQ_D` | `2` | Physical dimension |
-| `HPCQ_INIT_EDGES` | `4096` | Initial edge capacity |
-| `HPCQ_INIT_LOG` | `8192` | Initial gate log capacity |
-| `HPCQ_W2_RE[2]` | `{1.0, -1.0}` | Real parts of ω = e^{2πi/2} |
-| `HPCQ_W2_IM[2]` | `{0.0, 0.0}` | Imaginary parts |
-
-### 3.2 Local Gates
-
-```c
-/* ── Set local state to arbitrary 2-amplitude vector ── */
-void hpcq_set_local(HPCQGraph *g, uint64_t site,
-                    const double re[2], const double im[2]);
-
-/* ── Hadamard gate (⚠ use hpcq_hadamard_absorb if site has incident edges) ── */
-void hpcq_hadamard(HPCQGraph *g, uint64_t site);
-
-/* ── Hadamard with edge absorption ──
- * Correctly handles H on qubits that have incident CZ/phase edges.
- * Cases:
- *   0 incident edges → standard hpcq_hadamard (fast path)
- *   1 incident edge  → absorb into edge matrix
- *   >1 incident edges → multi-edge absorption (stored in absorb entry)
- *   Re-absorption    → two-layer evaluation (H²=I composition)
- */
-void hpcq_hadamard_absorb(HPCQGraph *g, uint64_t site);
-
-/* ── Phase gate Z(θ): |1⟩ → e^{iθ}|1⟩ ── */
-void hpcq_phase(HPCQGraph *g, uint64_t site, double theta);
-
-/* ── T gate:  |1⟩ → e^{iπ/4}|1⟩ ── */
-void hpcq_t(HPCQGraph *g, uint64_t site);
-
-/* ── T† gate: |1⟩ → e^{-iπ/4}|1⟩ ── */
-void hpcq_td(HPCQGraph *g, uint64_t site);
-
-/* ── Pauli-X (NOT): |0⟩↔|1⟩ ── */
-void hpcq_x(HPCQGraph *g, uint64_t site);
-```
-
-### 3.3 Two-Qubit Gates
-
-```c
-/* ── CZ gate: w(a,b) = (-1)^(a·b) ──
- * Key property: CZ² = I, so applying CZ twice cancels.
- * If a CZ edge already exists between (a,b), it is removed (swap-removed).
- */
-void hpcq_cz(HPCQGraph *g, uint64_t site_a, uint64_t site_b);
-
-/* ── General 2-site phase gate ──
- * Encodes a 4×4 unitary as diagonal phase edge w(j,k).
- * Only the diagonal phases G[(j,k),(j,k)] are extracted.
- * The normalization divides by |G[(j,k),(j,k)]|.
- *
- * @param G_re, G_im: 16-element arrays (row-major 4×4 complex matrix).
- */
-void hpcq_general_2site(HPCQGraph *g, uint64_t site_a, uint64_t site_b,
-                        const double *G_re, const double *G_im);
-
-/* Convenience: CNOT = H(target)·CZ(control,target)·H(target)
- *   hpcq_hadamard_absorb(g, t);
- *   hpcq_cz(g, c, t);
- *   hpcq_hadamard_absorb(g, t);
- */
-```
-
-### 3.4 Amplitude & Probability
-
-```c
-/* ── Compute ψ(i₁,...,iₙ) = [∏ₖ aₖ(iₖ)] × [∏_{edges} wₑ(iₐ,i_b)] ──
- * O(N + E). Step 1: product of local amplitudes. Step 2: edge phases.
- * Step 3: absorb correction (evaluates absorb entries).
- *
- * @param indices  Array of n_sites uint32 values (0 or 1).
- * @param out_re   Output real amplitude.
- * @param out_im   Output imaginary amplitude.
- */
-void hpcq_amplitude(const HPCQGraph *g, const uint32_t *indices,
-                    double *out_re, double *out_im);
-
-/* ── Probability = |ψ(indices)|² ── */
-double hpcq_probability(const HPCQGraph *g, const uint32_t *indices);
-```
-
-### 3.5 Marginal & Measurement
-
-```c
-/* ── Marginal probability P(site = value) ──
- * Enumerates 2^n_connected configurations of direct neighbors.
- * Only sums over sites with DIRECT edges to `site` (not the full
- * connected component). Does NOT evaluate absorb entries — for
- * correct results on absorbed graphs, use hpcq_sparse_tree instead.
- *
- * @param site   Site index.
- * @param value  0 or 1.
- * @returns      Marginal probability P(site = value).
- */
-double hpcq_marginal(const HPCQGraph *g, uint64_t site, uint32_t value);
-
-/* ── Measure site ──
- * 1. Compute P(0), P(1) via hpcq_marginal.
- * 2. Sample outcome from random_01.
- * 3. Collapse local state to |outcome⟩.
- * 4. Absorb phase from incident edges into partners.
- * 5. Remove resolved edges.
- *
- * @param site       Site to measure.
- * @param random_01  Random double in [0,1] for Born-rule sampling.
- * @returns          Outcome (0 or 1).
- */
-uint32_t hpcq_measure(HPCQGraph *g, uint64_t site, double random_01);
-```
-
-### 3.6 Norm & Entropy
-
-```c
-/* ── Total norm Σ|ψ|² (brute-force, N ≤ 20 only) ── */
-double hpcq_norm_sq(const HPCQGraph *g);
-
-/* ── Entropy estimate across bipartition cut ──
- * CZ edges contribute exactly 1 bit per crossing edge.
- * General edges contribute fidelity-weighted 1 bit.
- *
- * @param cut_after  Split point: sites 0..cut_after vs cut_after+1..N-1.
- */
-double hpcq_entropy_cut(const HPCQGraph *g, uint64_t cut_after);
-```
-
-### 3.7 Diagnostics
-
-```c
-/* ── Print formatted statistics ──
- * Site count, edge counts by type, amp/prob/measure eval counts,
- * fidelity stats, memory usage, estimated full state-vector size.
- */
-void hpcq_print_stats(const HPCQGraph *g);
-```
-
----
-
-## 4. HPC Sparse Vector & Sampling — `hpc_qubit_amplitude.h`
-
-### 4.1 Sparse Vector Lifecycle
-
-```c
-/* ── Create sparse vector ── */
-HPCQSparseVector *hpcq_sv_create(uint64_t n_sites, uint64_t initial_cap);
-
-/* ── Destroy sparse vector ── */
-void hpcq_sv_destroy(HPCQSparseVector *sv);
-
-/* ── Add entry (grows if needed) ── */
-void hpcq_sv_add(HPCQSparseVector *sv, const uint32_t *indices,
-                 double re, double im);
-
-/* ── Print sparse vector (up to max_show entries) ── */
-void hpcq_sv_print(const HPCQSparseVector *sv, int max_show);
-```
-
-### 4.2 Reconstruction
-
-```c
-/* ── Brute-force sparse reconstruction (N ≤ 20 only) ──
- * Enumerates all 2^N configurations. D=2 advantage: bitstring iteration.
- *
- * @param threshold   Minimum probability for inclusion.
- * @param max_entries Maximum entries to collect.
- */
-HPCQSparseVector *hpcq_sparse_brute(const HPCQGraph *g,
-                                     double threshold,
-                                     uint64_t max_entries);
-
-/* ── Tree-pruned sparse reconstruction (larger N) ──
- * At each site, extends live branches to both {0,1}. Prunes branches
- * below threshold. Applies absorb correction after full traversal.
- *
- * @param threshold     Minimum probability for inclusion.
- * @param max_branches  Maximum active branches (truncates lowest).
- */
-HPCQSparseVector *hpcq_sparse_tree(const HPCQGraph *g,
-                                    double threshold,
-                                    uint64_t max_branches);
-```
-
-### 4.3 Monte Carlo Expectation
-
-```c
-/* ── ⟨ψ|O|ψ⟩ via importance sampling ──
- * Samples from local product distribution, importance-weight by ψ-prob/q-prob.
- * Cost: O(n_samples × (N + E)).
- *
- * @param obs        Observable callback.
- * @param obs_ctx    User context passed to callback.
- * @param n_samples  Number of Monte Carlo samples.
- * @param rng_seed   Seed for internal LCG.
- */
-double hpcq_expectation(const HPCQGraph *g,
-                         HPCQObservable obs, void *obs_ctx,
-                         int n_samples, uint64_t rng_seed);
-
-/* Internal LCG macros (available for user PRNG) */
-#define HPCQ_LCG(r)   ((r) = (r) * 6364136223846793005ULL + 1442695040888963407ULL)
-#define HPCQ_RAND(r)  (((double)((r) >> 11)) * 0x1.0p-53)
-```
-
----
-
-## 5. HPC Bond Contraction — `hpc_qubit_contract.h`
-
-### 5.1 Hadamard Fold / Unfold
-
-```c
-/* ── Decompose 2-vector into symmetric/antisymmetric channels ──
- * plus = (ψ₀ + ψ₁)/√2   (|+⟩ channel)
- * minus = (ψ₀ - ψ₁)/√2   (|−⟩ channel)
- * Cost: O(2), zero multiplies.
- */
-HadamardFold hpcq_hadamard_fold(const double re[2], const double im[2]);
-
-/* ── Reconstruct 2-vector from HadamardFold channels ── */
-void hpcq_hadamard_unfold(const HadamardFold *hf, double re[2], double im[2]);
-```
-
-### 5.2 Pauli Decomposition
-
-```c
-/* ── Decompose 2×2 matrix into Pauli basis ──
- * M = c_I·I + c_Z·Z + c_X·X + c_Y·Y
- * where c_P = Tr(P·M)/2.
- *
- * Returns coefficients (re, im), energies (|c_P|²), and dominant channel.
- */
-PauliDecomposition hpcq_pauli_decompose(const double M_re[2][2],
-                                         const double M_im[2][2]);
-
-/* ── Project onto dominant Pauli component ──
- * Output = c_dominant · P_dominant
- */
-void hpcq_pauli_project(const double M_re[2][2], const double M_im[2][2],
-                         PauliChannel channel,
-                         double out_re[2][2], double out_im[2][2]);
-
-/* ── Fidelity = norm(projected) / norm(original) ── */
-double hpcq_compute_fidelity(const double orig_re[2][2], const double orig_im[2][2],
-                              const double proj_re[2][2], const double proj_im[2][2]);
-
-/* ── Select dominant Pauli channel (O(4) lookup) ── */
-PauliChannel hpcq_select_pauli(const double M_re[2][2], const double M_im[2][2]);
-```
-
-**Pauli Channels:**
-```c
-typedef enum {
-    PAULI_I = 0,   /* Identity */
-    PAULI_Z = 1,   /* Z-basis */
-    PAULI_X = 2,   /* X-basis */
-    PAULI_Y = 3    /* Y-basis */
-} PauliChannel;
-```
-
-### 5.3 Clifford Edge Encoding
-
-```c
-/* ── Encode a 2×2 phase interaction as a Clifford edge ──
- * Steps: decompose → select dominant → project → compute fidelity → store.
- * Total: O(16) operations.
- */
-void hpcq_encode_clifford(HPCQGraph *g, uint64_t site_a, uint64_t site_b,
-                           const double phase_re[2][2], const double phase_im[2][2]);
-```
-
-### 5.4 2-Site Gate Encoder
-
-```c
-/* ── Auto-select encoding strategy for a 2-qubit gate ──
- * (1) If exact CZ: exact edge (fidelity=1.0)
- * (2) If Pauli fidelity ≥ HPCQ_CLIFFORD_THRESHOLD (0.80): Clifford edge
- * (3) Otherwise: general phase edge via hpcq_general_2site
- */
-void hpcq_encode_2site(HPCQGraph *g, uint64_t site_a, uint64_t site_b,
-                        const double *G_re, const double *G_im);
-
-/* ── Fold analysis for a single site ──
- * Measures probability in |+⟩ vs |−⟩ channels.
- */
-HPCQFoldAnalysis hpcq_analyze_fold(const HPCQGraph *g, uint64_t site);
-```
-
----
-
-## 6. QubitEngine API — `qubit_engine.h` + `.c` files
-
-### 6.1 Lifecycle & Initialization (`qubit_core.c`)
-
-```c
-/* ── Initialize engine (zeros all counters, seeds PRNG) ── */
-void qubit_engine_init(QubitEngine *eng);
-
-/* ── Destroy engine (zeros all counters) ── */
-void qubit_engine_destroy(QubitEngine *eng);
-
-/* ── Allocate a new qubit initialized to |0⟩ ── */
-uint32_t qubit_init(QubitEngine *eng);
-
-/* ── Allocate a new qubit initialized to |+⟩ = (|0⟩+|1⟩)/√2 ── */
-uint32_t qubit_init_plus(QubitEngine *eng);
-
-/* ── Allocate a new qubit initialized to |k⟩ (k = 0 or 1) ── */
-uint32_t qubit_init_basis(QubitEngine *eng, int k);
-
-/* ── PRNG: uniform random double in [0,1) ── */
-double qubit_prng_double(QubitEngine *eng);
-```
-
-### 6.2 Gates (`qubit_gates.c`)
-
-All gates handle both local qubits and qubits in entangled pairs.
-
-```c
-void qubit_apply_hadamard(QubitEngine *eng, uint32_t id);  /* H */
-void qubit_apply_x(QubitEngine *eng, uint32_t id);          /* X */
-void qubit_apply_y(QubitEngine *eng, uint32_t id);          /* Y */
-void qubit_apply_z(QubitEngine *eng, uint32_t id);          /* Z */
-void qubit_apply_s(QubitEngine *eng, uint32_t id);          /* S = √Z */
-void qubit_apply_t(QubitEngine *eng, uint32_t id);          /* T = √S */
-void qubit_apply_phase(QubitEngine *eng, uint32_t id, double theta); /* Z(θ) */
-
-/* ── CZ: controlled-Z ── */
-void qubit_apply_cz(QubitEngine *eng, uint32_t id_a, uint32_t id_b);
-
-/* ── CNOT: controlled-X ── */
-void qubit_apply_cx(QubitEngine *eng, uint32_t ctrl, uint32_t target);
-
-/* ── Arbitrary single-qubit unitary (2×2 complex matrix) ── */
-void qubit_apply_unitary(QubitEngine *eng, uint32_t id,
-                          const double *U_re, const double *U_im);
-
-/* ── Arbitrary two-qubit unitary (4×4 complex matrix) ── */
-void qubit_apply_unitary_pair(QubitEngine *eng,
-                               uint32_t id_a, uint32_t id_b,
-                               const double *U_re, const double *U_im);
-```
-
-### 6.3 Measurement & Inspection (`qubit_measure.c`)
-
-```c
-/* ── Born-rule measurement (collapses to |0⟩ or |1⟩) ──
- * For entangled qubits, measures within the joint state.
- * Returns 0 or 1, or -1 on error.
- */
-int qubit_measure(QubitEngine *eng, uint32_t id);
-
-/* ── Measure one qubit of an entangled pair (marginal + collapse) ── */
-int qubit_measure_in_pair(QubitEngine *eng, uint32_t id);
-
-/* ── Non-destructive inspection ──
- * Returns probabilities, von Neumann entropy, purity, Schmidt rank.
- */
-QubitInspect qubit_inspect(QubitEngine *eng, uint32_t id);
-```
-
-### 6.4 Entanglement (`qubit_entangle.c`)
-
-```c
-/* ── Create Bell pair (|00⟩+|11⟩)/√2 between id_a and id_b ── */
-int qubit_entangle_bell(QubitEngine *eng, uint32_t id_a, uint32_t id_b);
-
-/* ── Entangle as product state |ψ_a⟩⊗|ψ_b⟩ (becomes entangled via CZ) ── */
-int qubit_entangle_product(QubitEngine *eng, uint32_t id_a, uint32_t id_b);
-
-/* ── Disentangle: extract marginals back into local states ── */
-void qubit_disentangle(QubitEngine *eng, uint32_t id_a, uint32_t id_b);
-```
-
-### 6.5 Registers (`qubit_register.c`)
-
-```c
-/* ── Initialize a logical register of n_qubits ── */
-int qubit_reg_init(QubitEngine *eng, uint64_t chunk_id,
-                    uint64_t n_qubits, uint32_t dim);
-
-/* ── GHZ entanglement: (|0⟩^N + |1⟩^N)/√2 (O(1) memory) ── */
-void qubit_reg_entangle_all(QubitEngine *eng, int reg_idx);
-
-/* ── Gates on register qubits ── */
-void qubit_reg_apply_hadamard(QubitEngine *eng, int reg_idx, uint64_t qubit_idx);
-void qubit_reg_apply_cz(QubitEngine *eng, int reg_idx,
-                         uint64_t idx_a, uint64_t idx_b);
-void qubit_reg_apply_unitary_pos(QubitEngine *eng, int reg_idx, uint64_t pos,
-                                  const double *U_re, const double *U_im);
-
-/* ── Measure a register qubit ── */
-uint64_t qubit_reg_measure(QubitEngine *eng, int reg_idx, uint64_t qubit_idx);
-
-/* ── State-vector access (for up to ~20 qubit registers) ── */
-SV_Amplitude qubit_reg_sv_get(QubitEngine *eng, int reg_idx, basis_t basis_k);
-void qubit_reg_sv_set(QubitEngine *eng, int reg_idx,
-                       basis_t basis_k, double re, double im);
-void qubit_reg_sv_stream(QubitEngine *eng, int reg_idx,
-                          sv_stream_fn callback, void *user_data);
-
-/* ── Total probability and inner product ── */
-double qubit_reg_sv_total_prob(QubitEngine *eng, int reg_idx);
-SV_Amplitude qubit_reg_sv_inner(QubitEngine *eng, int reg_a, int reg_b);
-
-/* ── Get local state vector of a register qubit ── */
-QubitState qubit_reg_local_sv(QubitEngine *eng, int reg_idx, uint64_t qubit_pos);
-```
-
----
-
-## 7. Qubit Management Primitives — `qubit_management.h`
-
-Low-level operations on individual QubitState / JointState.
-
-```c
-void qm_init_zero(QubitState *s);        /* |0⟩ */
-void qm_init_plus(QubitState *s);        /* |+⟩ = (|0⟩+|1⟩)/√2 */
-void qm_init_basis(QubitState *s, int k); /* |k⟩ */
-
-void qm_entangle_bell(JointState *j);                     /* (|00⟩+|11⟩)/√2 */
-void qm_entangle_product(JointState *j, const QubitState *sa, const QubitState *sb);
-
-double qm_total_prob(const QubitState *s);  /* Σ|ψₖ|² */
-void qm_renormalize(QubitState *s);         /* Normalize to unit norm */
-void qm_copy(QubitState *dst, const QubitState *src);  /* memcpy */
-```
-
----
-
-## 8. Entanglement Utilities — `entanglement.h`
-
-JointState creation, analysis, and manipulation.
-
-```c
-/* ── Bell states ── */
-void ent_bell(JointState *j);              /* (|00⟩+|11⟩)/√2 */
-void ent_bell_minus(JointState *j);        /* (|00⟩-|11⟩)/√2 */
-void ent_bell_psi_plus(JointState *j);     /* (|01⟩+|10⟩)/√2 */
-void ent_bell_psi_minus(JointState *j);    /* (|01⟩-|10⟩)/√2 — singlet */
-
-/* ── Product state: |ψ_a⟩⊗|ψ_b⟩ ── */
-void ent_product(JointState *j, const QubitState *sa, const QubitState *sb);
-
-/* ── Marginals from joint state ── */
-void ent_marginal_a(const JointState *j, double *probs);  /* P_A(a) */
-void ent_marginal_b(const JointState *j, double *probs);  /* P_B(b) */
-
-/* ── Entanglement measures ── */
-int ent_schmidt_rank(const JointState *j);       /* 1 or 2 */
-double ent_entropy(const JointState *j);          /* -Σλₖlog₂(λₖ) */
-
-/* ── Normalization ── */
-double ent_total_prob(const JointState *j);      /* Must equal 1.0 */
-void ent_renormalize(JointState *j);              /* Force unit norm */
-```
-
----
-
-## 9. Superposition (DFT₂) — `superposition.h`
-
-In-place Hadamard transform on 2 amplitudes.
-
-```c
-static const double DFT2_RE[2][2];   /* Twiddle table: 1/√2 × {{1,1},{1,-1}} */
-static const double DFT2_IM[2][2];   /* All zeros (Hadamard is real) */
-
-void sup_apply_hadamard(double *re, double *im);      /* In-place H */
-void sup_apply_hadamard_inv(double *re, double *im);  /* H† = H */
-void sup_renormalize(double *re, double *im, int D);  /* Force Σ|ψₖ|²=1 */
-```
-
----
-
-## 10. Born Rule — `born_rule.h`
-
-```c
-double born_prob(double re, double im);                      /* = re²+im² */
-double born_total_prob(const double *re, const double *im, int D);  /* Σ|ψₖ|² */
-int born_sample(const double *re, const double *im, int D, double rand_01);
-    /* Returns 0 if rand_01 < P(0), else 1 */
-void born_collapse(double *re, double *im, int D, int outcome);
-    /* Post-measurement: set |outcome⟩ to unit magnitude, other to 0 */
-double born_fast_isqrt(double x);  /* Fast 1/√x wrapper */
-```
-
----
-
-## 11. Floating-Point Primitives — `arithmetic.h`
-
-IEEE-754 bit-level fast approximations.
-
-```c
-/* Fast inverse sqrt (Quake III style, 2 Newton iterations, ~46-bit precision) */
-double arith_fast_isqrt(double x);
-
-/* Fast reciprocal (2 Newton iterations) */
-double arith_fast_recip(double x);
-```
-
-**Magic constants for direct IEEE-754 bit manipulation:**
-
-| Constant | Value | Purpose |
-|----------|-------|---------|
-| `IEEE754_SIGN_MASK` | `0x8000000000000000ULL` | Sign bit |
-| `IEEE754_EXP_MASK` | `0x7FF0000000000000ULL` | Exponent |
-| `IEEE754_MANT_MASK` | `0x000FFFFFFFFFFFFFULL` | Mantissa |
-| `MAGIC_ISQRT_F64` | `0x5FE6EB50C7B537A9ULL` | Double inv sqrt |
-| `MAGIC_RECIP_F64` | `0x7FDE623822FC16E6ULL` | Double reciprocal |
-| `MAGIC_SQRT_F64` | `0x1FF7A7EF9DB22D0EULL` | Double sqrt |
-| `ARITH_SQRT2_INV` | `0.7071067811865475244` | 1/√2 |
-
----
-
-## 12. BigInt Library — `bigint.h` / `bigint.c`
-
-4096-bit (64 × 64-bit limbs) arbitrary-precision integer arithmetic.
-
-### Constants
-
-| Macro | Value | Description |
-|-------|-------|-------------|
-| `BIGINT_LIMBS` | `64` | Number of 64-bit limbs |
-| `BIGINT_BYTES` | `512` | Total bytes |
-| `BIGINT_BITS` | `4096` | Total bits |
-
-### Core Types
-
-```c
-typedef struct {
-    uint64_t limbs[64];   /* Little-endian limb order */
-} BigInt;
-```
-
-### Arithmetic Operations
-
-```c
-void bigint_clear(BigInt *a);                        /* a = 0 */
-void bigint_copy(BigInt *dst, const BigInt *src);    /* dst = src */
-int  bigint_cmp(const BigInt *a, const BigInt *b);   /* returns 1,0,-1 */
-int  bigint_is_zero(const BigInt *a);                 /* a == 0? */
-
-void bigint_add(BigInt *result, const BigInt *a, const BigInt *b);   /* r = a+b */
-void bigint_sub(BigInt *result, const BigInt *a, const BigInt *b);   /* r = a-b */
-void bigint_mul(BigInt *result, const BigInt *a, const BigInt *b);   /* r = a×b */
-void bigint_div_mod(const BigInt *dividend, const BigInt *divisor,
-                     BigInt *quotient, BigInt *remainder);            /* q,r = N/D */
-
-void bigint_gcd(BigInt *result, const BigInt *a, const BigInt *b);   /* gcd */
-void bigint_pow_mod(BigInt *result, const BigInt *base,
-                     const BigInt *exp, const BigInt *mod);           /* b^e mod m */
-```
+### Core Operations
+
+| Function | Signature | Description |
+|----------|-----------|-------------|
+| `bigint_clear` | `void (BigInt *a)` | Zeros all limbs |
+| `bigint_copy` | `void (BigInt *dst, const BigInt *src)` | Deep copy |
+| `bigint_cmp` | `int (const BigInt *a, const BigInt *b)` | Returns 1 (a>b), 0 (a==b), -1 (a<b) |
+| `bigint_is_zero` | `int (const BigInt *a)` | Returns 1 if value is zero |
+
+### Arithmetic
+
+| Function | Signature | Description |
+|----------|-----------|-------------|
+| `bigint_add` | `void (BigInt *result, const BigInt *a, const BigInt *b)` | `result = a + b` |
+| `bigint_sub` | `void (BigInt *result, const BigInt *a, const BigInt *b)` | `result = a - b` |
+| `bigint_mul` | `void (BigInt *result, const BigInt *a, const BigInt *b)` | `result = a * b` (truncated to 4096 bits) |
+| `bigint_div_mod` | `void (const BigInt *dividend, const BigInt *divisor, BigInt *quotient, BigInt *remainder)` | Long division, outputs quotient and remainder |
 
 ### Bit Operations
 
-```c
-void bigint_shl1(BigInt *a);                          /* a <<= 1 */
-void bigint_shr1(BigInt *a);                          /* a >>= 1 */
-int  bigint_get_bit(const BigInt *a, uint32_t bit_index);   /* get bit n */
-void bigint_set_bit(BigInt *a, uint32_t bit_index);         /* set bit n */
-void bigint_clr_bit(BigInt *a, uint32_t bit_index);         /* clear bit n */
-uint32_t bigint_bitlen(const BigInt *a);                     /* MSB position */
-```
+| Function | Signature | Description |
+|----------|-----------|-------------|
+| `bigint_shl1` | `void (BigInt *a)` | Shift left by 1 bit (in-place) |
+| `bigint_shr1` | `void (BigInt *a)` | Shift right by 1 bit (in-place) |
+| `bigint_get_bit` | `int (const BigInt *a, uint32_t bit_index)` | Returns bit value (0 or 1) |
+| `bigint_set_bit` | `void (BigInt *a, uint32_t bit_index)` | Sets bit to 1 |
+| `bigint_clr_bit` | `void (BigInt *a, uint32_t bit_index)` | Clears bit to 0 |
+| `bigint_bitlen` | `uint32_t (const BigInt *a)` | Returns number of bits needed to represent the value |
 
 ### Conversion
 
-```c
-void bigint_set_u64(BigInt *a, uint64_t val);          /* From uint64 */
-uint64_t bigint_to_u64(const BigInt *a);                /* To uint64 (truncates) */
-int bigint_from_decimal(BigInt *a, const char *str);    /* Parse decimal string */
-void bigint_to_decimal(char *buf, size_t bufsize, const BigInt *a); /* To string */
-```
+| Function | Signature | Description |
+|----------|-----------|-------------|
+| `bigint_set_u64` | `void (BigInt *a, uint64_t val)` | Sets to a 64-bit unsigned integer |
+| `bigint_to_u64` | `uint64_t (const BigInt *a)` | Returns low 64 bits (truncation) |
+
+### Higher-Level
+
+| Function | Signature | Description |
+|----------|-----------|-------------|
+| `bigint_gcd` | `void (BigInt *result, const BigInt *a, const BigInt *b)` | Euclidean GCD |
+| `bigint_pow_mod` | `void (BigInt *result, const BigInt *base, const BigInt *exp, const BigInt *mod)` | Modular exponentiation (left-to-right binary) |
+
+### String Conversion
+
+| Function | Signature | Description |
+|----------|-----------|-------------|
+| `bigint_from_decimal` | `int (BigInt *a, const char *str)` | Parses decimal string; returns 0 on success, -1 on error |
+| `bigint_to_decimal` | `void (char *buf, size_t bufsize, const BigInt *a)` | Writes decimal string (buffer needs ~1240 chars) |
 
 ---
 
-## 13. Example Programs
+## Module 2: Arithmetic (`arithmetic.h`)
 
-| File | Description | Qubits | Engine |
-|------|-------------|--------|--------|
-| `Bitstate_template/shor_bs.c` | Shor factoring (up to ~12-bit N) via HPC graph build + classical measurement | 36-60 | HPC Graph |
-| `Bitstate_template/vqf_bs.c` | Variational Quantum Factoring (QAOA) — brute-force enumeration ≤20 qubits | ≤20 | HPC Graph |
-| `absorb_test.c` | Absorb mechanism unit tests (single/multi/re-absorb) | 2-4 | HPC Graph |
-| `supremacy.c` | Random circuit supremacy benchmark | variable | HPC Graph |
-| `universal_supremacy.c` | Universal gate set (H,T,CZ) supremacy | variable | HPC Graph |
-| `t_gate_full.c` | T-gate depth analysis with absorb verification | 2 | HPC Graph |
-| `stress_deep.c` | Deep-circuit stress test | variable | HPC Graph |
-| `stress_density.c` | Density / entropy measurement | variable | HPC Graph |
-| `clifford_exotic.c` | Clifford exotic benchmarks | variable | QubitEngine |
-| `randomized_depth.c` | Randomized circuit depth benchmarks | variable | HPC Graph |
+IEEE-754 constants and fast floating-point primitives via bit manipulation.
 
-### Quickstart (QubitEngine)
+### IEEE-754 Mask Constants
 
-```c
-#include "qubit_engine.h"
+| Constant | Value | Description |
+|----------|-------|-------------|
+| `IEEE754_SIGN_MASK` | `0x8000000000000000ULL` | Sign bit mask |
+| `IEEE754_EXP_MASK` | `0x7FF0000000000000ULL` | Exponent mask |
+| `IEEE754_MANT_MASK` | `0x000FFFFFFFFFFFFFULL` | Mantissa mask |
+| `IEEE754_EXP_BIAS` | `1023` | Double exponent bias |
+| `IEEE754_MANT_BITS` | `52` | Mantissa bit count |
 
-int main() {
-    QubitEngine eng;
-    qubit_engine_init(&eng);
+### Magic Constants
 
-    uint32_t q0 = qubit_init(&eng);          /* |0⟩ */
-    uint32_t q1 = qubit_init(&eng);          /* |0⟩ */
-    qubit_apply_hadamard(&eng, q0);          /* |+⟩ */
-    qubit_apply_cx(&eng, q0, q1);            /* Bell state: (|00⟩+|11⟩)/√2 */
+| Constant | Description |
+|----------|-------------|
+| `MAGIC_ISQRT_F32` | Quake III fast inverse sqrt (float) |
+| `MAGIC_ISQRT_F64` | Quake III fast inverse sqrt (double) |
+| `MAGIC_RECIP_F64` | Fast reciprocal magic |
+| `MAGIC_SQRT_F64` | Fast sqrt magic |
 
-    int outcome = qubit_measure(&eng, q0);   /* 0 or 1 */
-    printf("q0 = %d\n", outcome);
+### Substrate Constants
 
-    qubit_engine_destroy(&eng);
-    return 0;
-}
-```
+| Constant | Value | Description |
+|----------|-------|-------------|
+| `ARITH_PHI` | `1.6180339887498948482` | Golden ratio φ |
+| `ARITH_PHI_INV` | `0.6180339887498948482` | 1/φ |
+| `ARITH_SQRT2` | `1.4142135623730950488` | √2 |
+| `ARITH_SQRT2_INV` | `0.7071067811865475244` | 1/√2 |
+| `ARITH_DOTTIE` | `0.7390851332151606416` | Fixed point of cos (Dottie number) |
 
-### Quickstart (HPC Graph)
+### Fast Operations
 
-```c
-#include "hpc_qubit_graph.h"
-#include "hpc_qubit_amplitude.h"
-
-int main() {
-    HPCQGraph *g = hpcq_create(2);           /* 2 qubits */
-    hpcq_hadamard(g, 0);                     /* |+⟩ on q0 */
-    hpcq_cz(g, 0, 1);                       /* CZ between q0,q1 */
-    hpcq_hadamard_absorb(g, 1);              /* H on q1 with absorb */
-
-    /* Amplitude for |11⟩ */
-    uint32_t idx[] = {1, 1};
-    double re, im;
-    hpcq_amplitude(g, idx, &re, &im);
-    printf("ψ(1,1) = %.4f + %.4fi\n", re, im);
-
-    /* Sparse reconstruction */
-    HPCQSparseVector *sv = hpcq_sparse_tree(g, 1e-10, 1000);
-    hpcq_sv_print(sv, 10);
-    hpcq_sv_destroy(sv);
-
-    hpcq_destroy(g);
-    return 0;
-}
-```
+| Function | Signature | Description |
+|----------|-----------|-------------|
+| `arith_fast_isqrt` | `double (double x)` | Fast inverse sqrt (2 Newton iterations, ~46 bits precision) |
+| `arith_fast_recip` | `double (double x)` | Fast reciprocal (2 Newton iterations) |
 
 ---
 
-> **Files:** `hpc_qubit_graph.h`, `hpc_qubit_amplitude.h`, `hpc_qubit_contract.h`,
-> `qubit_engine.h`, `qubit_core.c`, `qubit_gates.c`, `qubit_measure.c`,
-> `qubit_entangle.c`, `qubit_register.c`, `qubit_triality.h/.c`,
-> `qubit_management.h`, `entanglement.h`, `superposition.h`, `born_rule.h`,
-> `flat_qubit.h`, `statevector.h`, `arithmetic.h`, `bigint.h/.c`,
-> `clifford_exotic.c`, `absorb_test.c`, `Bitstate_template/*.c`
+## Module 3: State Vector (`statevector.h`)
+
+Cache-aligned state vector storage types.
+
+### Types
+
+| Type | Fields | Size | Description |
+|------|--------|------|-------------|
+| `QubitState` | `double re[2], im[2]` | 32 bytes | Single-qubit amplitudes (|0⟩, |1⟩) |
+| `JointState` | `double re[4], im[4]` | 64 bytes | Two-qubit joint amplitudes; index `a*2+b` maps to |a,b⟩ |
+| `SV_Amplitude` | `double re, im, log2_mag` | 24 bytes | Streaming amplitude with log-magnitude for overflow avoidance |
+
+### Constants
+
+| Constant | Value | Description |
+|----------|-------|-------------|
+| `SV_D` | 2 | Qubit dimension |
+| `SV_D2` | 4 | Joint dimension (D×D) |
+| `SV_ELEMENT_SIZE` | 16 | Bytes per complex amplitude |
+| `SV_STATE_SIZE` | 32 | Bytes per QubitState |
+| `SV_JOINT_SIZE` | 64 | Bytes per JointState |
+
+### Access Primitives
+
+| Function | Signature | Description |
+|----------|-----------|-------------|
+| `sv_get_local` | `SV_Amplitude (const QubitState *s, int k)` | Get amplitude at index k from a QubitState |
+| `sv_get_joint` | `SV_Amplitude (const JointState *j, int a, int b)` | Get amplitude at |a,b⟩ from a JointState |
+
+---
+
+## Module 4: Superposition (`superposition.h`)
+
+DFT₂ (Hadamard) transform — the D=2 Fourier transform.
+
+### DFT₂ Twiddle Table
+
+| Variable | Description |
+|----------|-------------|
+| `DFT2_RE[2][2]` | Real part: `{{1/√2, 1/√2}, {1/√2, -1/√2}}` |
+| `DFT2_IM[2][2]` | Imaginary part: all zeros |
+
+### Functions
+
+| Function | Signature | Description |
+|----------|-----------|-------------|
+| `sup_apply_hadamard` | `void (double *re, double *im)` | In-place Hadamard transform: `H|ψ⟩ = (|ψ[0]+ψ[1]⟩/√2, |ψ[0]-ψ[1]⟩/√2)` |
+| `sup_apply_hadamard_inv` | `void (double *re, double *im)` | Inverse Hadamard (identical to forward since H²=I) |
+| `sup_renormalize` | `void (double *re, double *im, int D)` | Normalize total probability to 1.0 |
+
+---
+
+## Module 5: Born Rule (`born_rule.h`)
+
+Probability computation, sampling, and state collapse for D=2.
+
+### Functions
+
+| Function | Signature | Description |
+|----------|-----------|-------------|
+| `born_prob` | `double (double re, double im)` | `re² + im²` |
+| `born_total_prob` | `double (const double *re, const double *im, int D)` | Total probability across all D basis states |
+| `born_sample` | `int (const double *re, const double *im, int D, double rand_01)` | Born-rule sampling: returns 0 if `rand_01 < P(0)`, else 1 |
+| `born_collapse` | `void (double *re, double *im, int D, int outcome)` | Post-measurement collapse to |outcome⟩ (preserves phase of measured component) |
+| `born_fast_isqrt` | `double (double x)` | Fast inverse sqrt (~46-bit precision) — delegates to `arith_fast_isqrt` |
+
+---
+
+## Module 6: Entanglement (`entanglement.h`)
+
+Two-qubit joint state storage and entanglement analysis.
+
+### Bell States
+
+| Function | Signature | State Produced |
+|----------|-----------|----------------|
+| `ent_bell` | `void (JointState *j)` | Φ⁺ = (|00⟩+|11⟩)/√2 |
+| `ent_bell_minus` | `void (JointState *j)` | Φ⁻ = (|00⟩-|11⟩)/√2 |
+| `ent_bell_psi_plus` | `void (JointState *j)` | Ψ⁺ = (|01⟩+|10⟩)/√2 |
+| `ent_bell_psi_minus` | `void (JointState *j)` | Ψ⁻ = (|01⟩-|10⟩)/√2 (singlet) |
+
+### Product States
+
+| Function | Signature | Description |
+|----------|-----------|-------------|
+| `ent_product` | `void (JointState *j, const QubitState *sa, const QubitState *sb)` | Tensor product |ψ_a⟩ ⊗ |ψ_b⟩ |
+
+### Partial Trace / Marginals
+
+| Function | Signature | Description |
+|----------|-----------|-------------|
+| `ent_marginal_a` | `void (const JointState *j, double *probs)` | P_A(a) = Σ_b |ψ(a,b)|² |
+| `ent_marginal_b` | `void (const JointState *j, double *probs)` | P_B(b) = Σ_a |ψ(a,b)|² |
+
+### Entanglement Metrics
+
+| Function | Signature | Description |
+|----------|-----------|-------------|
+| `ent_schmidt_rank` | `int (const JointState *j)` | 1 = separable, 2 = entangled (via 2×2 complex determinant) |
+| `ent_entropy` | `double (const JointState *j)` | Von Neumann entropy of reduced density matrix ρ_A |
+| `ent_total_prob` | `double (const JointState *j)` | Sum of |ψ|² over all 4 basis states |
+| `ent_renormalize` | `void (JointState *j)` | Normalize total probability to 1.0 |
+
+---
+
+## Module 7: Qubit Engine (`qubit_engine.h` / `qubit_core.c`)
+
+Top-level container: manages qubits, pairs, registers, and PRNG.
+
+### Types
+
+| Type | Description |
+|------|-------------|
+| `Qubit` | Single qubit with `QubitState`, `pair_id`, `pair_side` (0=A, 1=B), `id` |
+| `QubitPair` | Entangled pair: `JointState`, `id_a`, `id_b`, `active` flag |
+| `QubitRegister` | Multi-qubit sparse state vector register (up to 4096 nonzero entries) |
+| `QubitEngine` | Master container: `qubits[]`, `pairs[]`, `registers[]`, `rng_state` |
+
+### Constants
+
+| Constant | Value | Description |
+|----------|-------|-------------|
+| `QUBIT_D` | 2 | Qubit dimension |
+| `MAX_QUBITS` | 262144 | Maximum allocatable qubits |
+| `MAX_PAIRS` | 262144 | Maximum entangled pairs |
+| `MAX_REGISTERS` | 16384 | Maximum registers |
+| `MAGIC_PTR(chunk, offset)` | `(((chunk)<<32)\|(offset))` | Encodes sparse pointer |
+
+### Core API — Lifecycle
+
+| Function | Signature | Description |
+|----------|-----------|-------------|
+| `qubit_engine_init` | `void (QubitEngine *eng)` | Initialize engine with Java LCG seed |
+| `qubit_engine_destroy` | `void (QubitEngine *eng)` | Reset engine to empty state |
+
+### Core API — Qubit Allocation
+
+| Function | Signature | Description |
+|----------|-----------|-------------|
+| `qubit_init` | `uint32_t (QubitEngine *eng)` | Allocate new qubit in |0⟩ state |
+| `qubit_init_plus` | `uint32_t (QubitEngine *eng)` | Allocate new qubit in |+⟩ = (|0⟩+|1⟩)/√2 |
+| `qubit_init_basis` | `uint32_t (QubitEngine *eng, int k)` | Allocate new qubit in |k⟩ |
+| `qubit_prng_double` | `double (QubitEngine *eng)` | Random double in [0,1) (LCG, 53-bit precision) |
+
+---
+
+## Module 8: Qubit Management (`qubit_management.h`)
+
+Low-level per-qubit state primitives.
+
+### Initialization
+
+| Function | Signature | Description |
+|----------|-----------|-------------|
+| `qm_init_zero` | `void (QubitState *s)` | Set to |0⟩ |
+| `qm_init_plus` | `void (QubitState *s)` | Set to |+⟩ = (|0⟩+|1⟩)/√2 |
+| `qm_init_basis` | `void (QubitState *s, int k)` | Set to |k⟩ |
+
+### Entanglement Primitives
+
+| Function | Signature | Description |
+|----------|-----------|-------------|
+| `qm_entangle_bell` | `void (JointState *j)` | Create Φ⁺ Bell state in joint state |
+| `qm_entangle_product` | `void (JointState *j, const QubitState *sa, const QubitState *sb)` | Create product state |ψ_a⟩⊗|ψ_b⟩ |
+
+### Utility
+
+| Function | Signature | Description |
+|----------|-----------|-------------|
+| `qm_total_prob` | `double (const QubitState *s)` | Sum of |ψ[k]|² |
+| `qm_renormalize` | `void (QubitState *s)` | Normalize to unit total probability |
+| `qm_copy` | `void (QubitState *dst, const QubitState *src)` | Deep copy |
+
+---
+
+## Module 9: Qubit Gates (`qubit_gates.c`)
+
+Standard quantum gates — each handles both local qubits and entangled pairs.
+
+### Single-Qubit Gates
+
+| Function | Signature | Gate | Description |
+|----------|-----------|------|-------------|
+| `qubit_apply_hadamard` | `void (QubitEngine *eng, uint32_t id)` | H | Hadamard: |0⟩↔|+⟩, |1⟩↔|−⟩ |
+| `qubit_apply_x` | `void (QubitEngine *eng, uint32_t id)` | X | Pauli X (bit flip): |0⟩↔|1⟩ |
+| `qubit_apply_y` | `void (QubitEngine *eng, uint32_t id)` | Y | Pauli Y ≡ iXZ |
+| `qubit_apply_z` | `void (QubitEngine *eng, uint32_t id)` | Z | Pauli Z (phase flip): |1⟩→-|1⟩ |
+| `qubit_apply_s` | `void (QubitEngine *eng, uint32_t id)` | S | Phase gate: |1⟩→i|1⟩ |
+| `qubit_apply_t` | `void (QubitEngine *eng, uint32_t id)` | T | T gate: |1⟩→e^{iπ/4}|1⟩ |
+| `qubit_apply_phase` | `void (QubitEngine *eng, uint32_t id, double theta)` | Rz(θ) | Arbitrary Z-rotation: |1⟩→e^{iθ}|1⟩ |
+| `qubit_apply_unitary` | `void (QubitEngine *eng, uint32_t id, const double *U_re, const double *U_im)` | U(2) | Arbitrary 2×2 unitary matrix |
+
+### Two-Qubit Gates
+
+| Function | Signature | Gate | Description |
+|----------|-----------|------|-------------|
+| `qubit_apply_cz` | `void (QubitEngine *eng, uint32_t id_a, uint32_t id_b)` | CZ | Controlled-Z: |1,1⟩→-|1,1⟩. Auto-creates product pair if not entangled. |
+| `qubit_apply_cx` | `void (QubitEngine *eng, uint32_t ctrl, uint32_t target)` | CNOT | Controlled-X: |c,t⟩→|c,c⊕t⟩. Auto-creates product pair if not entangled. |
+| `qubit_apply_unitary_pair` | `void (QubitEngine *eng, uint32_t id_a, uint32_t id_b, const double *U_re, const double *U_im)` | U(4) | Arbitrary 4×4 unitary on pair |
+
+---
+
+## Module 10: Qubit Measurement (`qubit_measure.c`)
+
+Born-rule measurement, collapse, and non-destructive inspection.
+
+### Functions
+
+| Function | Signature | Description |
+|----------|-----------|-------------|
+| `qubit_measure` | `int (QubitEngine *eng, uint32_t id)` | Measure qubit, collapse to |outcome⟩. Returns 0 or 1. |
+| `qubit_measure_in_pair` | `int (QubitEngine *eng, uint32_t id)` | Measure one qubit of an entangled pair via marginal probabilities |
+| `qubit_inspect` | `QubitInspect (QubitEngine *eng, uint32_t id)` | Non-destructive analysis: returns probabilities, entropy, purity, Schmidt rank |
+
+### `QubitInspect` Structure
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `prob[2]` | `double` | Born probabilities P(0), P(1) |
+| `entropy` | `double` | Shannon entropy -Σ P(k) log₂ P(k) |
+| `purity` | `double` | Tr(ρ²) = Σ P(k)² |
+| `schmidt_rank` | `int` | 1 = separable, 2 = entangled |
+
+---
+
+## Module 11: Qubit Entanglement (`qubit_entangle.c`)
+
+Creation and destruction of entangled qubit pairs.
+
+### Functions
+
+| Function | Signature | Description |
+|----------|-----------|-------------|
+| `qubit_entangle_bell` | `int (QubitEngine *eng, uint32_t id_a, uint32_t id_b)` | Create Φ⁺ Bell pair. Returns pair slot index, -1 on failure. |
+| `qubit_entangle_product` | `int (QubitEngine *eng, uint32_t id_a, uint32_t id_b)` | Create product pair |ψ_a⟩⊗|ψ_b⟩ from current local states |
+| `qubit_disentangle` | `void (QubitEngine *eng, uint32_t id_a, uint32_t id_b)` | Break pair: extract marginal probabilities to local states, deactivate pair |
+
+---
+
+## Module 12: Qubit Register (`qubit_register.c`)
+
+Sparse state vector register for multi-qubit states. Stores up to 4096 nonzero amplitudes.
+
+### Types
+
+| Type | Field | Description |
+|------|-------|-------------|
+| `RegisterEntry` | `basis_t basis_state, double amp_re, amp_im` | One basis → amplitude mapping |
+| `QubitRegister` | entries[4096], n_qubits, chunk_id, collapsed, bulk_rule... | Sparse register container |
+
+`bulk_rule`: `0`=general, `1`=GHZ, `2`=circuit.
+
+### Functions
+
+| Function | Signature | Description |
+|----------|-----------|-------------|
+| `qubit_reg_init` | `int (QubitEngine *eng, uint64_t chunk_id, uint64_t n_qubits, uint32_t dim)` | Create register. Returns index, -1 on failure. |
+| `qubit_reg_entangle_all` | `void (QubitEngine *eng, int reg_idx)` | Set register to GHZ state (|0⟩^N + |1⟩^N)/√2. Sets `bulk_rule=1`. |
+| `qubit_reg_apply_hadamard` | `void (QubitEngine *eng, int reg_idx, uint64_t qubit_idx)` | Apply Hadamard to one qubit position in the register |
+| `qubit_reg_apply_cz` | `void (QubitEngine *eng, int reg_idx, uint64_t idx_a, uint64_t idx_b)` | Apply CZ between two qubit positions |
+| `qubit_reg_apply_unitary_pos` | `void (QubitEngine *eng, int reg_idx, uint64_t pos, const double *U_re, const double *U_im)` | Apply D×D unitary to one qubit position |
+| `qubit_reg_measure` | `uint64_t (QubitEngine *eng, int reg_idx, uint64_t qubit_idx)` | Born-rule measurement with collapse. Returns outcome. |
+| `qubit_reg_sv_get` | `SV_Amplitude (QubitEngine *eng, int reg_idx, basis_t basis_k)` | Get amplitude at specific basis state |
+| `qubit_reg_sv_set` | `void (QubitEngine *eng, int reg_idx, basis_t basis_k, double re, double im)` | Set amplitude at specific basis state |
+| `qubit_reg_sv_stream` | `void (QubitEngine *eng, int reg_idx, sv_stream_fn callback, void *user_data)` | Stream all nonzero amplitudes through callback |
+| `qubit_reg_sv_total_prob` | `double (QubitEngine *eng, int reg_idx)` | Sum of |ψ|² over all entries |
+| `qubit_reg_sv_inner` | `SV_Amplitude (QubitEngine *eng, int reg_a, int reg_b)` | Inner product ⟨ψ_a|ψ_b⟩ between two registers |
+| `qubit_reg_local_sv` | `QubitState (QubitEngine *eng, int reg_idx, uint64_t qubit_pos)` | Partial trace to get single-qubit reduced state |
+
+---
+
+## Module 13: Triality (`qubit_triality.h` / `qubit_triality.c`)
+
+Three-view Pauli basis representation with lazy conversion.
+
+### Views
+
+| Enum Value | Pauli Basis | Meaning |
+|------------|-------------|---------|
+| `VIEW_EDGE` (0) | Z-basis | Computational basis: |0⟩, |1⟩ |
+| `VIEW_VERTEX` (1) | X-basis | Hadamard basis: |+⟩, |−⟩ |
+| `VIEW_DIAGONAL` (2) | Y-basis | S†·H basis: |+i⟩, |−i⟩ |
+
+### Gate Affinity
+
+- **Z, S, T, Phase**: O(1) in EDGE view (only touch |1⟩)
+- **X**: O(1) in VERTEX view (diagonal there)
+- **Y**: O(1) in DIAGONAL view (diagonal there)
+- **Hadamard**: O(1) relabeling (swaps Edge↔Vertex)
+
+### `TrialityQubit` Structure
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `re[3][2], im[3][2]` | `double` | Amplitudes in each of 3 views |
+| `dirty[3]` | `uint8_t` | View needs recomputation flag |
+| `current_view` | `TrialityView` | Last written view |
+| `active_mask` | `uint8_t` | Which basis states are nonzero (bit 0=|0⟩, bit 1=|1⟩) |
+| `is_eigenstate` | `uint8_t` | True if only one nonzero amplitude |
+| `conversions` / `conversion_savings` / `gates_applied` | `uint32_t` | Performance counters |
+
+### Triality API
+
+| Function | Signature | Description |
+|----------|-----------|-------------|
+| `tri_init` | `void (TrialityQubit *tq)` | Initialize to |0⟩ in EDGE view |
+| `tri_init_state` | `void (TrialityQubit *tq, TrialityView view, const double *re, const double *im)` | Initialize from given amplitudes in given view |
+| `tri_ensure_view` | `void (TrialityQubit *tq, TrialityView target)` | Lazy conversion: recompute target view if dirty |
+| `tri_convert` | `void (TrialityQubit *tq, TrialityView from, TrialityView to)` | Explicit view conversion (all 6 routes supported) |
+| `tri_get_amplitudes` | `void (TrialityQubit *tq, TrialityView view, double *re, double *im)` | Get amplitudes in given view (lazy recompute if dirty) |
+| `tri_apply_z` | `void (TrialityQubit *tq, double theta)` | Z(θ) gate: routes to EDGE view, marks VERTEX/DIAGONAL dirty |
+| `tri_apply_x` | `void (TrialityQubit *tq)` | X gate: routes to VERTEX view, applies Z-like diagonal operation |
+| `tri_apply_y` | `void (TrialityQubit *tq)` | Y gate: routes to DIAGONAL view |
+| `tri_apply_hadamard` | `void (TrialityQubit *tq)` | H gate: O(1) relabeling — swaps EDGE↔VERTEX amplitudes |
+| `tri_apply_s` | `void (TrialityQubit *tq)` | S gate: delegates to Z(π/2) |
+| `tri_apply_t` | `void (TrialityQubit *tq)` | T gate: delegates to Z(π/4) |
+| `tri_rotate` | `void (TrialityQubit *tq)` | Cycle views: Edge→Vertex→Diagonal→Edge |
+| `tri_rotate_back` | `void (TrialityQubit *tq)` | Reverse cycle |
+| `tri_measure` | `int (TrialityQubit *tq, TrialityView view, double rand_01)` | Born-rule measurement in specified view. Collapses, marks other views dirty. Returns 0 or 1. |
+| `tri_print_stats` | `void (const TrialityQubit *tq)` | Print performance counters |
+
+### Lazy Triality API (`LazyTrialityQubit`)
+
+Heisenberg-picture deferred evaluation: accumulates phase gates and DFT counts, materializes only at measurement.
+
+| Function | Signature | Description |
+|----------|-----------|-------------|
+| `lazy_tri_init` | `void (LazyTrialityQubit *lq)` | Initialize to |0⟩ |
+| `lazy_tri_apply_phase` | `void (LazyTrialityQubit *lq, double theta)` | Accumulate phase (fuses with last segment; up to 64 segments) |
+| `lazy_tri_apply_hadamard` | `void (LazyTrialityQubit *lq)` | Increment DFT counter (mod 2 since H²=I) |
+| `lazy_tri_materialize` | `void (LazyTrialityQubit *lq)` | Apply all accumulated operations to produce actual amplitudes |
+| `lazy_tri_measure` | `int (LazyTrialityQubit *lq, double rand_01)` | Materialize then measure. Collapses to |outcome⟩. Returns 0 or 1. |
+
+---
+
+## Module 14: Flat Qubit (`flat_qubit.h`)
+
+Two-tier flat representation optimization that breathes between complexity levels.
+
+### Representation Tiers
+
+| Mode | Value | When Used | Gate Cost |
+|------|-------|-----------|-----------|
+| `FLAT_BASIS` | 0 | Single |k⟩ with phase (Pauli eigenstate) | O(1) — all gates are trivial label/phase changes |
+| `QUANTUM_FULL` | 1 | General 2-amplitude superposition | O(2) — standard matrix multiplication |
+
+### `FlatQubit` Structure
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `mode` | `FlatMode` | Current representation tier |
+| `basis_k` | `uint8_t` | Which basis state in FLAT_BASIS mode |
+| `phase_re/im` | `double` | Phase factor (always unit magnitude) |
+| `re[2], im[2]` | `double` | Full amplitudes in QUANTUM_FULL mode |
+| `promotions` / `demotions` | `uint32_t` | Conversion counters |
+
+### Functions
+
+| Function | Signature | Description |
+|----------|-----------|-------------|
+| `flat_init` | `void (FlatQubit *fq)` | Init to |0⟩ in FLAT_BASIS mode |
+| `flat_init_basis` | `void (FlatQubit *fq, int k, double ph_re, double ph_im)` | Init to |k⟩ with phase |
+| `flat_from_amplitudes` | `void (FlatQubit *fq, const double *re, const double *im)` | Auto-detect mode from amplitudes |
+| `flat_promote` | `void (FlatQubit *fq)` | FLAT_BASIS → QUANTUM_FULL (expands to full amplitudes) |
+| `flat_try_demote` | `int (FlatQubit *fq)` | QUANTUM_FULL → FLAT_BASIS if possible. Returns 1 on success. |
+| `flat_apply_x` | `void (FlatQubit *fq)` | X gate (O(1) in FLAT_BASIS) |
+| `flat_apply_z` | `void (FlatQubit *fq)` | Z gate (O(1) in FLAT_BASIS) |
+| `flat_apply_phase` | `void (FlatQubit *fq, double theta)` | Phase gate (O(1) in FLAT_BASIS) |
+| `flat_apply_t` | `void (FlatQubit *fq)` | T gate = Z(π/4) |
+| `flat_apply_td` | `void (FlatQubit *fq)` | T† gate = Z(-π/4) |
+| `flat_apply_hadamard` | `void (FlatQubit *fq)` | Hadamard (always promotes, tries to demote after) |
+| `flat_get_amplitudes` | `void (const FlatQubit *fq, double *re, double *im)` | Read amplitudes regardless of mode |
+
+---
+
+## Module 15: HPC Qubit Graph (`hpc_qubit_graph.h`)
+
+The core holographic phase graph engine. States are represented as a graph:
+```
+ψ(i₁,...,iₙ) = [∏ aₖ(iₖ)] × [∏ wₑ(i_a, i_b)]
+```
+
+### Constants
+
+| Constant | Value | Description |
+|----------|-------|-------------|
+| `HPCQ_D` | 2 | Dimension per site |
+| `HPCQ_INIT_EDGES` | 4096 | Initial edge capacity |
+| `HPCQ_INIT_LOG` | 8192 | Initial gate log capacity |
+| `HPCQ_W2_RE[2]` | `{1.0, -1.0}` | Roots of unity (real) |
+| `HPCQ_W2_IM[2]` | `{0.0, 0.0}` | Roots of unity (imag) |
+| `HPCQ_CZ_W` / `HPCQ_CZ_W_RE` / `HPCQ_CZ_W_IM` | macros | CZ weight with continuous X-parity: `cos/sin(π·ab + xp_a·b + xp_b·a)` |
+
+### Edge Types
+
+| Enum | Description | Fidelity |
+|------|-------------|----------|
+| `HPCQ_EDGE_CZ` | Exact CZ: w(a,b)=(-1)^(a·b) | 1.0 |
+| `HPCQ_EDGE_PHASE` | General phase: arbitrary stored 2×2 matrix | <1.0 |
+| `HPCQ_EDGE_CLIFFORD` | Clifford-projected from Pauli decomposition | <1.0 |
+| `HPCQ_EDGE_ABSORBED` | Edge consumed by multi-edge H absorption | 1.0 |
+
+### `HPCQEdge` Structure
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `type` | `HPCQEdgeType` | Edge type |
+| `site_a`, `site_b` | `uint64_t` | Endpoint site indices |
+| `w_re[2][2]`, `w_im[2][2]` | `double` | 2×2 phase matrix (for PHASE/CLIFFORD types) |
+| `pauli_channel` | `uint8_t` | Clifford: which Pauli basis (0=I, 1=Z, 2=X, 3=Y) |
+| `xp_a`, `xp_b` | `double` | Continuous X-rotation (radians) on each endpoint |
+| `fidelity` | `double` | Quality metric (1.0 = lossless) |
+
+### `HPCQAbsorbEntry` — Multi-layer Absorption
+
+When H gates are applied to qubits with incident edges, edges are "absorbed" into a structured entry supporting multi-layer H-absorption chains for exact H·CZ·H = CNOT simulation.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `center` | `uint64_t` | Site index of the absorbed qubit |
+| `n_nbrs` | `uint64_t` | Number of incident neighbors |
+| `nbrs` | `uint64_t*` | Neighbor site indices |
+| `layer` | `uint8_t*` | Layer index per neighbor |
+| `w_re/im` | `double*` | Edge weight matrices per neighbor (size `n_nbrs*4`) |
+| `n_layers` | `int` | Number of H-absorption layers |
+| `a_re[2]/a_im[2]` | `double` | State BEFORE layer 0's H |
+| `a_layer_re/im` | `double*` | Per-layer intermediate states |
+| `x_parity` | `uint8_t` | X-gate parity since last H absorption |
+| `layer_x_parity` | `uint8_t*` | X parity recorded per layer |
+
+### `HPCQGraph` — The State
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `n_sites` | `uint64_t` | Number of qubits in simulation |
+| `locals` | `TrialityQubit*` | Per-site local states (Z/X/Y views) |
+| `n_edges`, `edges` | `uint64_t`, `HPCQEdge*` | Entanglement graph edges |
+| `n_absorb`, `absorb` | `uint64_t`, `HPCQAbsorbEntry*` | Absorbed multi-edge entries |
+| `gate_log` | `HPCQGateEntry*` | Gate operation log |
+| `inc_counts/edges` | Per-site incident edge lists | O(1) edge lookup per site |
+| `absorb_idx` | `int64_t*` | Per-site absorb entry index (-1 = none) |
+| `amp_evals`, `prob_evals`, `measurements` | `uint64_t` | Performance counters |
+| `global_phase_parity` | `uint64_t` | Accounts for Z·X = -X·Z anticommutation |
+
+### Lifecycle
+
+| Function | Signature | Description |
+|----------|-----------|-------------|
+| `hpcq_create` | `HPCQGraph* (uint64_t n_sites)` | Allocate graph with n_sites qubits, initialized to |0⟩ |
+| `hpcq_destroy` | `void (HPCQGraph *g)` | Free all memory |
+
+### Local Gates
+
+| Function | Signature | Description |
+|----------|-----------|-------------|
+| `hpcq_set_local` | `void (HPCQGraph *g, uint64_t site, const double re[2], const double im[2])` | Set local state explicitly |
+| `hpcq_hadamard` | `void (HPCQGraph *g, uint64_t site)` | Simple Hadamard (no incident edges handled). **Prefer `hpcq_hadamard_absorb`.** |
+| `hpcq_hadamard_absorb` | `void (HPCQGraph *g, uint64_t site)` | **Correct H gate.** Handles: 0 incident edges (simple H), 1 edge (single-edge absorption), >1 edges (multi-edge absorption), or re-absorption on already-absorbed centers (layered chain). |
+| `hpcq_phase` | `void (HPCQGraph *g, uint64_t site, double theta)` | Z(θ) phase gate |
+| `hpcq_t` | `void (HPCQGraph *g, uint64_t site)` | T gate: phase by π/4 |
+| `hpcq_td` | `void (HPCQGraph *g, uint64_t site)` | T† gate: phase by -π/4 |
+| `hpcq_x` | `void (HPCQGraph *g, uint64_t site)` | Pauli X: flips bit on local state, adds π to xp on incident CZ edges, or toggles x_parity on absorbed centers |
+| `hpcq_rx` | `void (HPCQGraph *g, uint64_t site, double theta)` | Continuous X-rotation Rx(θ). Adds θ to xp on incident CZ edges. |
+
+### Entangling Gates
+
+| Function | Signature | Description |
+|----------|-----------|-------------|
+| `hpcq_cz` | `void (HPCQGraph *g, uint64_t site_a, uint64_t site_b)` | **Exact CZ.** If edge already exists between pair, CZ²=I cancellation triggers (swap-removes edge, applies residual Z gates for accumulated xp). Fidelity always 1.0. |
+| `hpcq_cz_force` | `void (HPCQGraph *g, uint64_t sa, uint64_t sb)` | CZ **without** cancellation (use when CZ·Rx·CZ ≠ I) |
+| `hpcq_general_2site` | `void (HPCQGraph *g, uint64_t site_a, uint64_t site_b, const double *G_re, const double *G_im)` | General 4×4 two-qubit gate: extracts diagonal phases and stores as PHASE edge |
+
+### Amplitude Evaluation
+
+| Function | Signature | Description |
+|----------|-----------|-------------|
+| `hpcq_amplitude` | `void (const HPCQGraph *g, const uint32_t *indices, double *out_re, double *out_im)` | **O(N+E) point query**: compute ψ(i₁,...,iₙ) for a specific configuration. Handles absorbed centers via connected-component joint sums with H-chain evaluation and variable elimination for large components. |
+| `hpcq_probability` | `double (const HPCQGraph *g, const uint32_t *indices)` | |ψ(i₁,...,iₙ)|² |
+| `hpcq_marginal` | `double (const HPCQGraph *g, uint64_t site, uint32_t value)` | P(site_k = v) — marginal probability for a single site |
+| `hpcq_measure` | `uint32_t (HPCQGraph *g, uint64_t site, double random_01)` | Born-rule measurement: computes marginals, samples, collapses local state, absorbs edge phases into partners, removes resolved edges |
+| `hpcq_norm_sq` | `double (const HPCQGraph *g)` | Exhaustive Σ|ψ|² over all 2^N configurations (N ≤ 20 only) |
+| `hpcq_entropy_cut` | `double (const HPCQGraph *g, uint64_t cut_after)` | Bipartition entanglement entropy estimate: 1 bit per crossing CZ edge × fidelity |
+
+### Diagnostics
+
+| Function | Signature | Description |
+|----------|-----------|-------------|
+| `hpcq_print_stats` | `void (const HPCQGraph *g)` | Print graph statistics: sites, edges by type, amp evals, measurements, fidelity, memory usage, full SV size comparison |
+| `hpcq_update_fidelity_stats` | `void (HPCQGraph *g)` | Recompute min/avg fidelity from current edges |
+
+### Internal
+
+| Function | Signature | Description |
+|----------|-----------|-------------|
+| `hpcq_grow_edges` | `void (HPCQGraph *g)` | Double edge capacity if full |
+| `hpcq_log_gate` | `void (HPCQGraph *g, HPCQGateEntry entry)` | Record gate in operation log |
+| `hpcq_inc_add` | `void (HPCQGraph *g, uint64_t site, uint64_t edge_idx)` | Add edge to site's incident list |
+| `hpcq_inc_remove` | `void (HPCQGraph *g, uint64_t site, uint64_t edge_idx)` | Remove edge from site's incident list |
+
+---
+
+## Module 16: HPC Qubit Amplitude (`hpc_qubit_amplitude.h`)
+
+On-demand sparse state vector reconstruction and Monte Carlo expectation values. Never materializes the full 2^N state vector.
+
+### Types
+
+| Type | Description |
+|------|-------------|
+| `HPCQSparseEntry` | `uint32_t *indices`, `double re, im, prob` |
+| `HPCQSparseVector` | `HPCQSparseEntry *entries`, `count`, `capacity`, `total_prob`, `threshold` |
+| `HPCQTreeNode` | `uint32_t *indices`, `double re, im` — for tree-pruned reconstruction |
+| `HPCQObservable` | `double (*)(const uint32_t *indices, uint64_t n_sites, void *ctx)` |
+
+### Functions
+
+| Function | Signature | Description |
+|----------|-----------|-------------|
+| `hpcq_sv_create` | `HPCQSparseVector* (uint64_t n_sites, uint64_t initial_cap)` | Allocate sparse vector |
+| `hpcq_sv_destroy` | `void (HPCQSparseVector *sv)` | Free sparse vector |
+| `hpcq_sv_add` | `void (HPCQSparseVector *sv, const uint32_t *indices, double re, double im)` | Add an entry (auto-grows) |
+| `hpcq_sparse_brute` | `HPCQSparseVector* (const HPCQGraph *g, double threshold, uint64_t max_entries)` | **O(2^N × N+E)**. Enumerate all configurations, keep those above threshold. N ≤ 20 only. |
+| `hpcq_sparse_tree` | `HPCQSparseVector* (const HPCQGraph *g, double threshold, uint64_t max_branches)` | **Tree-pruned** reconstruction: binary tree with pruning at each site. Grows 2 children per node (D=2). Handles absorb corrections. For N > 20. |
+| `hpcq_expectation` | `double (const HPCQGraph *g, HPCQObservable obs, void *obs_ctx, int n_samples, uint64_t rng_seed)` | **Monte Carlo expectation** ⟨ψ|O|ψ⟩ via importance sampling. Cost: O(n_samples × (N+E)). N ≤ 64. |
+| `hpcq_sv_print` | `void (const HPCQSparseVector *sv, int max_show)` | Print sparse vector entries |
+
+---
+
+## Module 17: HPC Qubit Contract (`hpc_qubit_contract.h`)
+
+Pauli-aware bond encoding — the D=2 analog of HexState's syntheme-based contraction.
+
+### Pauli Channels
+
+| Enum | Value | Pauli | Description |
+|------|-------|-------|-------------|
+| `PAULI_I` | 0 | I | Identity |
+| `PAULI_Z` | 1 | Z | Computational basis |
+| `PAULI_X` | 2 | X | Hadamard basis |
+| `PAULI_Y` | 3 | Y | S†·H basis |
+
+### Predefined Pauli Matrices
+
+| Variable | Description |
+|----------|-------------|
+| `PAULI_I_RE/IM` | Identity matrix |
+| `PAULI_Z_RE/IM` | Z = diag(1, -1) |
+| `PAULI_X_RE/IM` | X = anti-diag(1, 1) |
+| `PAULI_Y_RE/IM` | Y: im part has anti-diag(-1, 1) |
+
+### Types
+
+| Type | Description |
+|------|-------------|
+| `HadamardFold` | `plus_re/im`, `minus_re/im` — symmetric/antisymmetric channel decomposition |
+| `PauliDecomposition` | `coeff_re/im[4]`, `energy[4]`, `dominant` — Pauli basis decomposition of a 2×2 matrix |
+| `HPCQFoldAnalysis` | `plus_fidelity`, `minus_fidelity`, `fold_entropy` — entanglement channel analysis |
+
+### Hadamard Fold (D=2 Vesica Fold)
+
+| Function | Signature | Description |
+|----------|-----------|-------------|
+| `hpcq_hadamard_fold` | `HadamardFold (const double re[2], const double im[2])` | Decompose state into |+⟩ (symmetric) and |−⟩ (antisymmetric) channels |
+| `hpcq_hadamard_unfold` | `void (const HadamardFold *hf, double re[2], double im[2])` | Reconstruct state from fold |
+
+### Pauli Decomposition
+
+| Function | Signature | Description |
+|----------|-----------|-------------|
+| `hpcq_pauli_decompose` | `PauliDecomposition (const double M_re[2][2], const double M_im[2][2])` | Decompose 2×2 matrix into Pauli basis: M = c_I·I + c_Z·Z + c_X·X + c_Y·Y, where c_P = Tr(P·M)/2 |
+| `hpcq_pauli_project` | `void (const double M_re[2][2], const double M_im[2][2], PauliChannel channel, double out_re[2][2], double out_im[2][2])` | Project onto single Pauli channel |
+| `hpcq_compute_fidelity` | `double (const double orig_re[2][2], const double orig_im[2][2], const double proj_re[2][2], const double proj_im[2][2])` | Compute fidelity: norm(proj)² / norm(orig)² |
+| `hpcq_select_pauli` | `PauliChannel (const double M_re[2][2], const double M_im[2][2])` | Select dominant Pauli channel |
+
+### Edge Encoding
+
+| Function | Signature | Description |
+|----------|-----------|-------------|
+| `hpcq_encode_clifford` | `void (HPCQGraph *g, uint64_t site_a, uint64_t site_b, const double phase_re[2][2], const double phase_im[2][2])` | Encode as Clifford edge: decompose into Pauli, select dominant, project, normalize, add as HPCQ_EDGE_CLIFFORD |
+| `hpcq_encode_2site` | `void (HPCQGraph *g, uint64_t site_a, uint64_t site_b, const double *G_re, const double *G_im)` | Auto-encode 4×4 gate: test for CZ → use hpcq_cz, if Pauli fidelity ≥ 0.80 → clifford encoding, else → general phase edge |
+| `hpcq_analyze_fold` | `HPCQFoldAnalysis (const HPCQGraph *g, uint64_t site)` | Analyze entanglement in symmetric/antisymmetric channels for a site |
+
+---
+
+## Module 18: HPC qLDPC (`hpc_qldpc.h`)
+
+Quantum Low-Density Parity-Check codes with hypergraph product construction.
+
+### Types
+
+| Type | Description |
+|------|-------------|
+| `QLDPCCode` | Contains H1[r1×n1], H2[r2×n2], qubit index arrays, ancilla counts, total simulation qubit count |
+
+### Functions
+
+| Function | Signature | Description |
+|----------|-----------|-------------|
+| `qldpc_create` | `QLDPCCode* (int n1, int n2, int w_c, int w_r, uint64_t *seed)` | Create hypergraph product code: n1×n2 data qubits, r1=r2=n1/2 checks. `w_c`=column weight, `w_r`=row weight. Automatically allocates qubit IDs. |
+| `qldpc_destroy` | `void (QLDPCCode *c)` | Free all memory |
+| `qldpc_build_circuit` | `void (HPCQGraph *g, QLDPCCode *c)` | Build syndrome extraction circuit on HPC graph: Z-stabilizers (H1 rows × H2 cols) and X-stabilizers (H1 cols × H2 rows) |
+| `qldpc_print` | `void (QLDPCCode *c)` | Print code statistics: physical/logical qubits, rate, stabilizer counts |
+| `qlcg` | `uint64_t (uint64_t *s)` | LCG: `s = s*6364136223846793005+1442695040888963407` |
+| `qldpc_gen_H` | `uint8_t* (int r, int n, int w_c, int w_r, uint64_t *seed)` | Generate sparse random (w_c,w_r)-regular LDPC matrix |
+
+---
+
+## Module 19: HPC Shor's Algorithm (`hpc_shors.h`)
+
+Shor's algorithm factorization on the HPC graph.
+
+### Functions
+
+| Function | Signature | Description |
+|----------|-----------|-------------|
+| `sgcd` | `uint64_t (uint64_t a, uint64_t b)` | Euclidean GCD |
+| `scrz` | `void (HPCQGraph *g, uint64_t c, uint64_t t, double th)` | Controlled-Rz via CNOT = H·CZ·H decomposition |
+| `sqft` | `void (HPCQGraph *g, uint64_t *q, int n, int inv)` | Quantum Fourier Transform / Inverse QFT |
+| `scmodmul` | `void (HPCQGraph *g, uint64_t ctrl, uint64_t *targ, int tn, uint64_t c, uint64_t N)` | Controlled modulo multiplication: |x⟩ → |c·x mod N⟩ |
+| `shors_circuit` | `void (HPCQGraph *g, uint64_t N, uint64_t a, uint64_t *per, int pn, uint64_t *targ, int tn)` | Build full Shor's circuit: initialize period register, apply controlled modular exponentiations a^(2^k) mod N, IQFT |
+| `shors_factor` | `int (HPCQGraph *g, uint64_t N, uint64_t a, int pn, int tn, uint64_t *f1, uint64_t *f2)` | Factor N: enumerate period register to find period r, compute gcd(a^(r/2) ± 1, N). Returns 1 on success (f1, f2 = factors). Returns 0 on failure. |
+
+---
+
+## Module 20: Clifford Exotic (`clifford_exotic.h` / `clifford_exotic.c`)
+
+Clifford group exotic automorphism for D=2. The single-qubit Clifford group C₁ has 24 elements (isomorphic to S₄).
+
+### Types
+
+| Type | Description |
+|------|-------------|
+| `CliffordElement` | `int axes[3], sign[3]` — maps (Z,X,Y)→(sign[0]·P_axes[0], sign[1]·P_axes[1], sign[2]·P_axes[2]) |
+| `CliffordGate` | `double re[2][2], im[2][2]` — 2×2 unitary matrix |
+
+### Constants
+
+| Constant | Value | Description |
+|----------|-------|-------------|
+| `CLIFF_ORDER` | 24 | Number of single-qubit Clifford elements |
+| `CLIFF_N_AXES` | 3 | Pauli axes: Z, X, Y |
+| `CLIFF_NUM_CLASSES` | 5 | Number of conjugacy classes |
+
+### Conjugacy Classes
+
+| Index | Description | Size |
+|-------|-------------|------|
+| 0 | Identity {I} | 1 |
+| 1 | Half-turns {±Z, ±X, ±Y} | 6 |
+| 2 | Quarter-turns {±S, ±S†, ...} | 6 |
+| 3 | Third-turns {H, SH, ...} | 8 |
+| 4 | Sixth-turns {HS, ...} | 3 |
+
+### Group API
+
+| Function | Signature | Description |
+|----------|-----------|-------------|
+| `cliff_init` | `void (void)` | Generate all 24 Clifford elements and their 2×2 matrices (idempotent) |
+| `cliff_get_element` | `const CliffordElement* (int idx)` | Get Clifford element by index |
+| `cliff_get_gate` | `const CliffordGate* (int idx)` | Get 2×2 gate matrix by index |
+| `cliff_compose` | `int (int a, int b)` | Compose two elements: returns index of a∘b |
+| `cliff_inverse` | `int (int idx)` | Returns index of inverse element |
+| `cliff_identity` | `void (void)` | Returns index of identity element |
+
+### Exotic Gate Application
+
+| Function | Signature | Description |
+|----------|-----------|-------------|
+| `cliff_apply_exotic_gate` | `void (const double *in_re, const double *in_im, double *out_re, double *out_im, int clifford_idx)` | Apply C·|ψ⟩: transform state by Clifford gate matrix |
+| `cliff_dual_probabilities` | `void (const double *re, const double *im, double *probs_std, double *probs_exo, int clifford_idx)` | Compute standard AND Clifford-conjugated Born probabilities |
+
+### Invariants
+
+| Function | Signature | Description |
+|----------|-----------|-------------|
+| `cliff_exotic_invariant` | `double (const double *re, const double *im)` | Δ_C = (1/24) Σ_C ||P_std - P_C||². 0 = symmetric under all Clifford conjugations (no preferred Pauli frame). |
+| `cliff_exotic_entropy` | `double (const double *re, const double *im, int clifford_idx)` | ΔS = S_std - S_exotic (Shannon entropy difference) |
+| `cliff_exotic_fingerprint` | `void (const double *re, const double *im, double *class_deltas)` | Per-conjugacy-class invariant breakdown (5 values) |
+
+### Triality Bridge
+
+| Function | Signature | Description |
+|----------|-----------|-------------|
+| `cliff_target_view` | `int (int clifford_idx)` | Which triality view this Clifford element maps Z to: 0=Edge, 1=Vertex, 2=Diagonal |
+
+---
+
+## Architecture Notes
+
+### Memory Model
+
+- **QubitEngine mode**: N qubits × 32 bytes + P pairs × 64 bytes = O(N+P)
+- **HPC Graph mode**: N sites × 112 bytes (TrialityQubit) + E edges × ~136 bytes = O(N+E)
+- State vector is **never materialized** — amplitudes computed on demand
+
+### Key Design Properties
+
+1. **CZ² = I cancellation**: Re-applying CZ to the same pair removes the edge, preventing unbounded edge growth
+2. **Continuous X-parity**: `xp_a, xp_b` track accumulated X-rotations on CZ edges for exact `Rx(θ)·CZ·Rx(θ)` decomposition
+3. **Multi-layer absorption**: `hpcq_hadamard_absorb` correctly handles `H·CZ·H = CNOT` via layered absorption chains (verified to depth L=4+)
+4. **Topology-agnostic**: Any qubit can connect to any qubit via CZ edges — no grid restriction
+5. **Absorption evaluation**: Absorbed centers are evaluated via connected-component joint sums; large components use variable elimination with `O(2^treewidth)` complexity rather than `O(2^total_vars)`
+
+### Performance Benchmarks (from README)
+
+| Metric | Google Willow | BitState |
+|--------|---------------|----------|
+| Qubits | 105 | **4,000,000** |
+| Cycles | ~25 | 100 |
+| Memory | N/A | 1.37 GB |
+| Build time | N/A | 0.70 s |
+
+### Verification
+
+BitState produces numerically identical amplitudes to brute-force state vector simulation:
+- 16 qubits, 16 cycles: 65536 basis states — 0 mismatches, fidelity² = 1.0
+- 9 qubits, 12 cycles: 512 basis states — 0 mismatches, fidelity² = 1.0
