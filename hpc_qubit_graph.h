@@ -1641,23 +1641,36 @@ static inline void hpcq_amplitude(const HPCQGraph *g,
 
             #define VE_MAX_VARS 128
             #define VE_MAX_VARS 128
-            #define VE_MAX_SCOPE 12
-            #define VE_MAX_NVALS (1 << VE_MAX_SCOPE)
+            #define VE_MAX_SCOPE 24
 
             int ve_max_factors = 4096;
-            typedef struct { uint64_t vars[VE_MAX_SCOPE]; int n_vars; int n_vals; double re[VE_MAX_NVALS]; double im[VE_MAX_NVALS]; } VE_F;
+            typedef struct { uint64_t vars[VE_MAX_SCOPE]; int n_vars; int n_vals; double *re; double *im; } VE_F;
             VE_F *vf = (VE_F *)calloc(ve_max_factors, sizeof(VE_F)); int nvf = 0;
-            #define VE_CHECK() do { if (nvf >= ve_max_factors) { \
-                ve_max_factors *= 2; \
-                vf = (VE_F *)realloc(vf, ve_max_factors * sizeof(VE_F)); \
-                memset(&vf[nvf], 0, (ve_max_factors - nvf) * sizeof(VE_F)); \
-            } } while(0)
 
-            /* Helper: add a 1-variable factor over variable v with values v0, v1 */
+            /* Allocate a fresh factor with nv variables (2^nv entries) */
+            #define ve_alloc(f, nv) do { \
+                (f)->n_vars = (nv); (f)->n_vals = 1 << (nv); \
+                (f)->re = (double *)calloc((f)->n_vals, sizeof(double)); \
+                (f)->im = (double *)calloc((f)->n_vals, sizeof(double)); \
+            } while(0)
+
+            /* Ensure capacity for nvf+1, allocating a fresh slot */
+            #define VE_CHECK() do { \
+                if (nvf >= ve_max_factors) { \
+                    ve_max_factors *= 2; \
+                    vf = (VE_F *)realloc(vf, ve_max_factors * sizeof(VE_F)); \
+                    memset(&vf[nvf], 0, (ve_max_factors - nvf) * sizeof(VE_F)); \
+                } \
+                vf[nvf].re = NULL; vf[nvf].im = NULL; \
+                nvf++; \
+            } while(0)
+
+            /* Helper: add a 1-variable factor */
             #define ve_add1(v, v0r, v0i, v1r, v1i) do { \
-                VE_CHECK(); VE_CHECK(); VE_F *f = &vf[nvf++]; memset(f,0,sizeof(VE_F)); \
-                f->vars[0]=v; f->n_vars=1; f->n_vals=2; \
-                f->re[0]=(v0r); f->im[0]=(v0i); f->re[1]=(v1r); f->im[1]=(v1i); \
+                VE_CHECK(); \
+                vf[nvf-1].vars[0] = (v); ve_alloc(&vf[nvf-1], 1); \
+                vf[nvf-1].re[0] = (v0r); vf[nvf-1].im[0] = (v0i); \
+                vf[nvf-1].re[1] = (v1r); vf[nvf-1].im[1] = (v1i); \
             } while(0)
 
             /* Helper: multiply two factors, store in vf[nvf] */
@@ -1726,8 +1739,8 @@ static inline void hpcq_amplitude(const HPCQGraph *g,
                       sr0=ar0*or0-ai0*oi0; si0=ar0*oi0+ai0*or0;
                       sr1=ar1*or1-ai1*oi1; si1=ar1*oi1+ai1*or1; }
                     /* Build 2-variable factor for H[yc][yp] * sf[yc] * Z_parity[yp] */
-                    VE_CHECK(); VE_F *f = &vf[nvf++]; memset(f,0,sizeof(VE_F));
-                    f->vars[0] = vp; f->vars[1] = vc; f->n_vars = 2; f->n_vals = 4;
+                    VE_CHECK(); VE_F *f = &vf[nvf-1]; ve_alloc(f, 2);
+                    f->vars[0] = vp; f->vars[1] = vc;
                     for (int yp = 0; yp < 2; yp++) {
                         for (int yc = 0; yc < 2; yc++) {
                             double H = (yc == 0) ? SQ : (yp == 0 ? SQ : -SQ);
@@ -1795,8 +1808,8 @@ static inline void hpcq_amplitude(const HPCQGraph *g,
                         if (a >= aj) continue;
                         uint64_t va = var_start[mi] + (uint64_t)li;
                         uint64_t vb = var_start[mi2] + (uint64_t)lj;
-                        VE_CHECK(); VE_F *f = &vf[nvf++]; memset(f,0,sizeof(VE_F));
-                        f->vars[0] = va; f->vars[1] = vb; f->n_vars = 2; f->n_vals = 4;
+                        VE_CHECK(); VE_F *f = &vf[nvf-1]; ve_alloc(f, 2);
+                        f->vars[0] = va; f->vars[1] = vb;
                         for (int ya = 0; ya < 2; ya++)
                             for (int yb = 0; yb < 2; yb++) {
                                 int wk_idx = (int)k * 4 + ya * 2 + yb;
@@ -1825,8 +1838,7 @@ static inline void hpcq_amplitude(const HPCQGraph *g,
                 uint64_t va = indices[g->absorb[aa].center] ^ g->absorb[aa].x_parity;
                 uint64_t vb = indices[g->absorb[ab].center] ^ g->absorb[ab].x_parity;
                 double wr = HPCQ_CZ_W(va, vb, xp_a, xp_b);
-                VE_CHECK(); VE_F *f = &vf[nvf++]; memset(f,0,sizeof(VE_F));
-                f->n_vars = 0; f->n_vals = 1;
+                VE_CHECK(); VE_F *f = &vf[nvf-1]; ve_alloc(f, 0);
                 f->re[0] = wr; f->im[0] = 0.0;
             }
 
@@ -1849,14 +1861,22 @@ static inline void hpcq_amplitude(const HPCQGraph *g,
                 int best_v = -1; uint64_t best_cost = (uint64_t)-1;
                 for (uint64_t v = 0; v < total_vars; v++) {
                     if (!var_active[v]) continue;
-                    uint64_t cost = 1;
+                    /* Cost = 2^(scope) where scope = number of distinct variables
+                     * in the union of all factors containing v */
+                    uint64_t scope = 0;  /* bitmap of variables in union */
                     for (int fi = 0; fi < nvf; fi++) {
+                        int found = 0;
                         for (int k = 0; k < vf[fi].n_vars; k++)
-                            if (vf[fi].vars[k] == v) {
-                                cost *= (uint64_t)vf[fi].n_vals;
-                                break;
-                            }
+                            if (vf[fi].vars[k] == v) { found = 1; break; }
+                        if (found) {
+                            for (int k = 0; k < vf[fi].n_vars; k++)
+                                scope |= 1ULL << vf[fi].vars[k];
+                        }
                     }
+                    /* Count set bits in scope */
+                    int n_scope = 0; uint64_t sc = scope;
+                    while (sc) { n_scope++; sc &= sc - 1; }
+                    uint64_t cost = (uint64_t)1 << n_scope;
                     if (cost < best_cost) { best_cost = cost; best_v = (int)v; }
                 }
                 if (best_v < 0) break;
@@ -1874,11 +1894,10 @@ static inline void hpcq_amplitude(const HPCQGraph *g,
                     if (first < 0) { first = fi; continue; }
                     /* Multiply vf[fi] into vf[first] */
                     int sav_nvf = nvf;
-                    /* Use temporary factor */
                     VE_F tmp = vf[first];
-                    /* Recompute first = tmp * vf[fi] */
+                    vf[first].re = NULL; vf[first].im = NULL;
                     VE_F *fa = &tmp, *fb = &vf[fi];
-                    VE_F *fc = &vf[first]; memset(fc,0,sizeof(VE_F));
+                    VE_F *fc = &vf[first];
                     int ni=0, ia=0, ib=0;
                     while (ia < fa->n_vars || ib < fb->n_vars) {
                         if (ib>=fb->n_vars || (ia<fa->n_vars && fa->vars[ia]<fb->vars[ib]))
@@ -1887,9 +1906,7 @@ static inline void hpcq_amplitude(const HPCQGraph *g,
                             fc->vars[ni++] = fb->vars[ib++];
                         else { fc->vars[ni++] = fa->vars[ia]; ia++; ib++; }
                     }
-                    fc->n_vars = ni; fc->n_vals = 1 << ni;
-                    memset(fc->re, 0, fc->n_vals * sizeof(double));
-                    memset(fc->im, 0, fc->n_vals * sizeof(double));
+                    ve_alloc(fc, ni);
                     for (int a2 = 0; a2 < fb->n_vals; a2++) {
                         uint64_t fb_assign = 0;
                         for (int k = 0; k < fb->n_vars; k++)
@@ -1914,44 +1931,48 @@ static inline void hpcq_amplitude(const HPCQGraph *g,
                             fc->im[idx] += fa->re[a1] * fb->im[a2] + fa->im[a1] * fb->re[a2];
                         }
                     }
-                    /* Mark vf[fi] as inactive by swapping with last */
-                    /* For simplicity, just mark it; we'll compact later if needed */
+                    free(tmp.re); free(tmp.im);
+                    free(vf[fi].re); free(vf[fi].im);
                     vf[fi].n_vars = 0; /* invalid */
                 }
                 /* Now sum out v from vf[first] */
                 if (first >= 0) {
                     VE_F *f = &vf[first];
-                    VE_F tmp = *f;
                     int pos = -1;
-                    for (int k = 0; k < tmp.n_vars; k++)
-                        if (tmp.vars[k] == (uint64_t)v) { pos = k; break; }
+                    for (int k = 0; k < f->n_vars; k++)
+                        if (f->vars[k] == (uint64_t)v) { pos = k; break; }
                     if (pos >= 0) {
-                        int new_n = tmp.n_vars - 1;
+                        int new_n = f->n_vars - 1;
+                        double *old_re = f->re, *old_im = f->im;
+                        int old_nvars = f->n_vars;
+                        int old_nvals = f->n_vals;
+                        uint64_t old_vars[VE_MAX_SCOPE];
+                        memcpy(old_vars, f->vars, old_nvars * sizeof(uint64_t));
+                        /* Build new vars array */
                         int ni = 0;
-                        for (int k = 0; k < tmp.n_vars; k++)
-                            if (k != pos) f->vars[ni++] = tmp.vars[k];
+                        for (int k = 0; k < old_nvars; k++)
+                            if (k != pos) f->vars[ni++] = old_vars[k];
                         f->n_vars = new_n;
                         f->n_vals = new_n > 0 ? (1 << new_n) : 1;
-                        memset(f->re, 0, f->n_vals * sizeof(double));
-                        memset(f->im, 0, f->n_vals * sizeof(double));
-                        int full_vals = 1 << tmp.n_vars;
-                        for (int fi = 0; fi < full_vals; fi++) {
+                        f->re = (double *)calloc(f->n_vals, sizeof(double));
+                        f->im = (double *)calloc(f->n_vals, sizeof(double));
+                        for (int fi = 0; fi < old_nvals; fi++) {
                             uint64_t out_idx = 0;
-                            for (int k = 0; k < tmp.n_vars; k++) {
+                            for (int k = 0; k < old_nvars; k++) {
                                 if (k == pos) continue;
                                 int bit = (fi >> k) & 1;
                                 int dest = k < pos ? k : k - 1;
                                 out_idx |= bit << dest;
                             }
                             if (new_n == 0) {
-                                f->re[0] += tmp.re[fi];
-                                f->im[0] += tmp.im[fi];
+                                f->re[0] += old_re[fi];
+                                f->im[0] += old_im[fi];
                             } else {
-                                f->re[out_idx] += tmp.re[fi];
-                                f->im[out_idx] += tmp.im[fi];
+                                f->re[out_idx] += old_re[fi];
+                                f->im[out_idx] += old_im[fi];
                             }
                         }
-                        if (new_n == 0) { f->n_vals = 1; }
+                        free(old_re); free(old_im);
                     }
                 }
                 /* Compact: keep only valid factors (with vars or constants) */
@@ -1976,6 +1997,7 @@ static inline void hpcq_amplitude(const HPCQGraph *g,
                 double ni = comp_re * vf[fi].im[0] + comp_im * vf[fi].re[0];
                 comp_re = nr; comp_im = ni;
             }
+            for (int fi = 0; fi < nvf; fi++) { free(vf[fi].re); free(vf[fi].im); }
             free(vf);
             #undef ve_add1
             #undef ve_mul
