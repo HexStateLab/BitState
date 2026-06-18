@@ -1649,7 +1649,7 @@ static inline void hpcq_amplitude(const HPCQGraph *g,
 
             /* Allocate a fresh factor with nv variables (2^nv entries) */
             #define ve_alloc(f, nv) do { \
-                (f)->n_vars = (nv); (f)->n_vals = 1 << (nv); \
+                (f)->n_vars = (nv); (f)->n_vals = (int)((uint64_t)1 << (nv)); \
                 (f)->re = (double *)calloc((f)->n_vals, sizeof(double)); \
                 (f)->im = (double *)calloc((f)->n_vals, sizeof(double)); \
             } while(0)
@@ -1691,7 +1691,7 @@ static inline void hpcq_amplitude(const HPCQGraph *g,
                 for (int a2 = 0; a2 < fb->n_vals; a2++) { \
                     uint64_t fb_assign = 0; \
                     for (int k = 0; k < fb->n_vars; k++) \
-                        fb_assign |= ((a2 >> k) & 1) << fb->vars[k]; \
+                        fb_assign |= (uint64_t)((a2 >> k) & 1) << fb->vars[k]; \
                     for (int a1 = 0; a1 < fa->n_vals; a1++) { \
                         int ok = 1; uint64_t fa_assign = 0; \
                         for (int k = 0; k < fa->n_vars; k++) { \
@@ -1842,47 +1842,38 @@ static inline void hpcq_amplitude(const HPCQGraph *g,
                 f->re[0] = wr; f->im[0] = 0.0;
             }
 
-            /* Eliminate variables using min-degree ordering */
+            /* Interleaved descending elimination: for each center's chain,
+             * eliminate from the last layer downward, round-robin across
+             * centers.  Optimal for chains with cross-couplings (treewidth ≤ 4). */
             int *elim_order = (int *)calloc(total_vars, sizeof(int));
             int *var_active = (int *)calloc(total_vars, sizeof(int));
             for (uint64_t i = 0; i < total_vars; i++) var_active[i] = (int)active[i];
             free(active);
 
-            { /* debug: dump all factors */
-              for (int fi=0;fi<nvf;fi++) {
-              }
-            }
-
+            /* Build interleaved order: for each layer depth (deepest first),
+             * add that layer's variable from each center that has it. */
             int n_elim = 0;
-            int n_active = 0;
-            for (uint64_t i = 0; i < total_vars; i++) if (var_active[i]) n_active++;
-            for (int iter = 0; iter < n_active; iter++) {
-                /* Find variable with minimum factor scope product (min-degree heuristic) */
-                int best_v = -1; uint64_t best_cost = (uint64_t)-1;
-                for (uint64_t v = 0; v < total_vars; v++) {
-                    if (!var_active[v]) continue;
-                    /* Cost = 2^(scope) where scope = number of distinct variables
-                     * in the union of all factors containing v */
-                    uint64_t scope = 0;  /* bitmap of variables in union */
-                    for (int fi = 0; fi < nvf; fi++) {
-                        int found = 0;
-                        for (int k = 0; k < vf[fi].n_vars; k++)
-                            if (vf[fi].vars[k] == v) { found = 1; break; }
-                        if (found) {
-                            for (int k = 0; k < vf[fi].n_vars; k++)
-                                scope |= 1ULL << vf[fi].vars[k];
+            int max_layer = 0;
+            for (uint64_t mi = 0; mi < sz; mi++) {
+                int L = nl_arr[mems[mi]];
+                if (L > max_layer) max_layer = L;
+            }
+            for (int depth = max_layer - 1; depth >= 0; depth--) {
+                for (uint64_t mi = 0; mi < sz; mi++) {
+                    int L = nl_arr[mems[mi]];
+                    if (depth < L) {
+                        uint64_t vs = var_start[mi];
+                        int v = (int)(vs + (uint64_t)depth);
+                        if (var_active[v]) {
+                            elim_order[n_elim++] = v;
+                            var_active[v] = 0;
                         }
                     }
-                    /* Count set bits in scope */
-                    int n_scope = 0; uint64_t sc = scope;
-                    while (sc) { n_scope++; sc &= sc - 1; }
-                    uint64_t cost = (uint64_t)1 << n_scope;
-                    if (cost < best_cost) { best_cost = cost; best_v = (int)v; }
                 }
-                if (best_v < 0) break;
-                elim_order[n_elim++] = best_v;
-                int v = best_v;
-                var_active[v] = 0;
+            }
+            /* Eliminate in the pre-computed order */
+            for (int oi = 0; oi < n_elim; oi++) {
+                int v = elim_order[oi];
 
                 /* Find all factors containing v, multiply them, sum out v */
                 int first = -1;
@@ -1908,14 +1899,14 @@ static inline void hpcq_amplitude(const HPCQGraph *g,
                     }
                     ve_alloc(fc, ni);
                     for (int a2 = 0; a2 < fb->n_vals; a2++) {
-                        uint64_t fb_assign = 0;
+                        __uint128_t fb_assign = 0;
                         for (int k = 0; k < fb->n_vars; k++)
-                            fb_assign |= ((a2 >> k) & 1) << fb->vars[k];
+                        fb_assign |= (__uint128_t)((a2 >> k) & 1) << fb->vars[k];
                         for (int a1 = 0; a1 < fa->n_vals; a1++) {
-                            int ok = 1; uint64_t fa_assign = 0;
+                            int ok = 1; __uint128_t fa_assign = 0;
                             for (int k = 0; k < fa->n_vars; k++) {
                                 int bit = (a1 >> k) & 1;
-                                fa_assign |= bit << fa->vars[k];
+                                fa_assign |= (__uint128_t)bit << fa->vars[k];
                                 for (int j = 0; j < fb->n_vars; j++)
                                     if (fa->vars[k] == fb->vars[j]) {
                                         if (bit != ((fb_assign >> fb->vars[j]) & 1)) ok = 0;
@@ -1923,10 +1914,10 @@ static inline void hpcq_amplitude(const HPCQGraph *g,
                                     }
                             }
                             if (!ok) continue;
-                            uint64_t full = fa_assign | fb_assign;
+                            __uint128_t full = fa_assign | fb_assign;
                             uint64_t idx = 0;
                             for (int k = 0; k < ni; k++)
-                                idx |= ((full >> fc->vars[k]) & 1) << k;
+                                idx |= (int)((full >> fc->vars[k]) & 1) << k;
                             fc->re[idx] += fa->re[a1] * fb->re[a2] - fa->im[a1] * fb->im[a2];
                             fc->im[idx] += fa->re[a1] * fb->im[a2] + fa->im[a1] * fb->re[a2];
                         }
@@ -1992,7 +1983,6 @@ static inline void hpcq_amplitude(const HPCQGraph *g,
             /* Multiply all remaining constant factors into the result scalar */
             comp_re = 1.0; comp_im = 0.0;
             for (int fi = 0; fi < nvf; fi++) {
-                if (vf[fi].n_vars > 0) continue; /* skip non-constant factors (shouldn't exist) */
                 double nr = comp_re * vf[fi].re[0] - comp_im * vf[fi].im[0];
                 double ni = comp_re * vf[fi].im[0] + comp_im * vf[fi].re[0];
                 comp_re = nr; comp_im = ni;
