@@ -1766,7 +1766,7 @@ static inline void hpcq_amplitude(const HPCQGraph *g,
                 }
             }
 
-            /* Build absorbed CZ pair factors */
+            /* Build absorbed cc edge factors — order-matched + half-absorbed */
             for (uint64_t mi = 0; mi < sz; mi++) {
                 uint64_t a = mems[mi];
                 for (uint64_t k = 0; k < g->absorb[a].n_nbrs; k++) {
@@ -1774,83 +1774,60 @@ static inline void hpcq_amplitude(const HPCQGraph *g,
                     int64_t aj_idx = g->absorb_idx[nb];
                     if (aj_idx < 0) continue;
                     uint64_t aj = (uint64_t)aj_idx;
+                    int li = (int)g->absorb[a].layer[k];
+                    if (li >= (int)var_count[mi]) continue;
                     uint64_t mi2 = 0;
                     for (; mi2 < sz && mems[mi2] != aj; mi2++);
                     if (mi2 == sz) continue;
-                    if (a >= aj) continue;
-                    int li = (int)g->absorb[a].layer[k];
-                    if (li >= (int)var_count[mi] || li >= (int)var_count[mi2]) continue;
-                    uint64_t va = var_start[mi] + li;
-                    uint64_t vb = var_start[mi2] + li;
-                    uint64_t ca = g->absorb[a].center, cb = nb;
-                    double xp_va = 0, xp_vb = 0;
-                    for (uint64_t ee = 0; ee < g->n_edges; ee++) {
-                        const HPCQEdge *ce = &g->edges[ee];
-                        if ((ce->site_a == ca && ce->site_b == cb) || (ce->site_a == cb && ce->site_b == ca)) {
-                            xp_va = (ce->site_a == ca) ? ce->xp_a : ce->xp_b;
-                            xp_vb = (ce->site_a == ca) ? ce->xp_b : ce->xp_a;
-                            break;
+                    /* Order-matching: i-th edge to nb matches i-th edge to a */
+                    int occ_a = 0;
+                    for (uint64_t kk = 0; kk <= k; kk++)
+                        if (g->absorb[a].nbrs[kk] == nb) occ_a++;
+                    int occ_b = 0, lj = -1;
+                    for (uint64_t k2 = 0; k2 < g->absorb[aj].n_nbrs; k2++) {
+                        if (g->absorb[aj].nbrs[k2] == g->absorb[a].center) {
+                            occ_b++;
+                            if (occ_b == occ_a) { lj = (int)g->absorb[aj].layer[k2]; break; }
                         }
                     }
-                    VE_CHECK(); VE_F *f = &vf[nvf++]; memset(f,0,sizeof(VE_F));
-                    f->vars[0] = va; f->vars[1] = vb; f->n_vars = 2; f->n_vals = 4;
-                    for (int aa2 = 0; aa2 < 2; aa2++)
-                        for (int bb2 = 0; bb2 < 2; bb2++) {
-                            int idx = aa2 * 2 + bb2;
-                            f->re[idx] = HPCQ_CZ_W(aa2, bb2, xp_va, xp_vb);
-                            f->im[idx] = 0.0;
-                        }
+                    if (lj >= 0 && lj < (int)var_count[mi2]) {
+                        /* Fully matched cc edge — apply from lower-indexed center */
+                        if (a >= aj) continue;
+                        uint64_t va = var_start[mi] + (uint64_t)li;
+                        uint64_t vb = var_start[mi2] + (uint64_t)lj;
+                        VE_CHECK(); VE_F *f = &vf[nvf++]; memset(f,0,sizeof(VE_F));
+                        f->vars[0] = va; f->vars[1] = vb; f->n_vars = 2; f->n_vals = 4;
+                        for (int ya = 0; ya < 2; ya++)
+                            for (int yb = 0; yb < 2; yb++) {
+                                int wk_idx = (int)k * 4 + ya * 2 + yb;
+                                f->re[ya*2 + yb] = g->absorb[a].w_re[wk_idx];
+                                f->im[ya*2 + yb] = g->absorb[a].w_im[wk_idx];
+                            }
+                    } else {
+                        /* Half-absorbed: couple ya[li] to partner xv */
+                        uint64_t xv_b = indices[nb] ^ g->absorb[aj].x_parity;
+                        uint64_t va = var_start[mi] + (uint64_t)li;
+                        ve_add1(va,
+                            g->absorb[a].w_re[(int)k*4 + 0*2 + (int)xv_b],
+                            g->absorb[a].w_im[(int)k*4 + 0*2 + (int)xv_b],
+                            g->absorb[a].w_re[(int)k*4 + 1*2 + (int)xv_b],
+                            g->absorb[a].w_im[(int)k*4 + 1*2 + (int)xv_b]);
+                    }
                 }
             }
 
-            /* Build non-absorbed CZ pair factors (na_ce) */
+            /* Build non-absorbed CZ factors — constant (use output xv) */
             for (uint64_t ei = 0; ei < n_na_ce; ei++) {
                 uint64_t aa = na_ce_a[ei], ab = na_ce_b[ei], ee = na_ce_e[ei];
                 const HPCQEdge *edge = &g->edges[ee];
-                uint64_t mi_a, mi_b;
-                for (mi_a = 0; mi_a < sz && mems[mi_a] != aa; mi_a++);
-                for (mi_b = 0; mi_b < sz && mems[mi_b] != ab; mi_b++);
-                if (mi_a >= sz || mi_b >= sz) continue;
-                int L_a = nl_arr[aa], L_b = nl_arr[ab];
-                if (L_a < 1 || L_b < 1) continue;
-                uint64_t va = (L_a == 1) ? (uint64_t)-1 : var_start[mi_a] + L_a - 1;
-                uint64_t vb = (L_b == 1) ? (uint64_t)-1 : var_start[mi_b] + L_b - 1;
                 double xp_a = (edge->site_a == g->absorb[aa].center) ? edge->xp_a : edge->xp_b;
                 double xp_b = (edge->site_a == g->absorb[aa].center) ? edge->xp_b : edge->xp_a;
-                if (L_a == 1 && L_b == 1) {
-                    /* Both L=1: depends on indices, not inner vars — constant factor */
-                    uint64_t va_fixed = indices[g->absorb[aa].center] ^ g->absorb[aa].x_parity;
-                    uint64_t vb_fixed = indices[g->absorb[ab].center] ^ g->absorb[ab].x_parity;
-                    double wr = HPCQ_CZ_W(va_fixed, vb_fixed, xp_a, xp_b);
-                    VE_CHECK(); VE_F *f = &vf[nvf++]; memset(f,0,sizeof(VE_F));
-                    f->n_vars = 0; f->n_vals = 1;
-                    f->re[0] = wr; f->im[0] = 0.0;
-                } else if (L_a == 1) {
-                    uint64_t va_fixed = indices[g->absorb[aa].center] ^ g->absorb[aa].x_parity;
-                    VE_CHECK(); VE_F *f = &vf[nvf++]; memset(f,0,sizeof(VE_F));
-                    f->vars[0] = vb; f->n_vars = 1; f->n_vals = 2;
-                    for (int b = 0; b < 2; b++) {
-                        f->re[b] = HPCQ_CZ_W(va_fixed, b, xp_a, xp_b);
-                        f->im[b] = 0.0;
-                    }
-                } else if (L_b == 1) {
-                    uint64_t vb_fixed = indices[g->absorb[ab].center] ^ g->absorb[ab].x_parity;
-                    VE_CHECK(); VE_F *f = &vf[nvf++]; memset(f,0,sizeof(VE_F));
-                    f->vars[0] = va; f->n_vars = 1; f->n_vals = 2;
-                    for (int a = 0; a < 2; a++) {
-                        f->re[a] = HPCQ_CZ_W(a, vb_fixed, xp_a, xp_b);
-                        f->im[a] = 0.0;
-                    }
-                } else {
-                    VE_CHECK(); VE_F *f = &vf[nvf++]; memset(f,0,sizeof(VE_F));
-                    f->vars[0] = va; f->vars[1] = vb; f->n_vars = 2; f->n_vals = 4;
-                    for (int aa3 = 0; aa3 < 2; aa3++)
-                        for (int bb3 = 0; bb3 < 2; bb3++) {
-                            int idx = aa3 * 2 + bb3;
-                            f->re[idx] = HPCQ_CZ_W(aa3, bb3, xp_a, xp_b);
-                            f->im[idx] = 0.0;
-                        }
-                }
+                uint64_t va = indices[g->absorb[aa].center] ^ g->absorb[aa].x_parity;
+                uint64_t vb = indices[g->absorb[ab].center] ^ g->absorb[ab].x_parity;
+                double wr = HPCQ_CZ_W(va, vb, xp_a, xp_b);
+                VE_CHECK(); VE_F *f = &vf[nvf++]; memset(f,0,sizeof(VE_F));
+                f->n_vars = 0; f->n_vals = 1;
+                f->re[0] = wr; f->im[0] = 0.0;
             }
 
             /* Eliminate variables using min-degree ordering */
@@ -1859,9 +1836,15 @@ static inline void hpcq_amplitude(const HPCQGraph *g,
             for (uint64_t i = 0; i < total_vars; i++) var_active[i] = (int)active[i];
             free(active);
 
+            { /* debug: dump all factors */
+              for (int fi=0;fi<nvf;fi++) {
+              }
+            }
+
             int n_elim = 0;
-            for (uint64_t i = 0; i < total_vars; i++) {
-                if (!var_active[i]) continue;
+            int n_active = 0;
+            for (uint64_t i = 0; i < total_vars; i++) if (var_active[i]) n_active++;
+            for (int iter = 0; iter < n_active; iter++) {
                 /* Find variable with minimum factor scope product (min-degree heuristic) */
                 int best_v = -1; uint64_t best_cost = (uint64_t)-1;
                 for (uint64_t v = 0; v < total_vars; v++) {
@@ -1960,8 +1943,7 @@ static inline void hpcq_amplitude(const HPCQGraph *g,
                                 int dest = k < pos ? k : k - 1;
                                 out_idx |= bit << dest;
                             }
-                            int out_ni = new_n > 0 ? new_n : 1;
-                            if (out_ni == 1) {
+                            if (new_n == 0) {
                                 f->re[0] += tmp.re[fi];
                                 f->im[0] += tmp.im[fi];
                             } else {
@@ -1972,21 +1954,24 @@ static inline void hpcq_amplitude(const HPCQGraph *g,
                         if (new_n == 0) { f->n_vals = 1; }
                     }
                 }
-                /* Compact: remove invalid factors (keep constants) */
+                /* Compact: keep only valid factors (with vars or constants) */
                 int w = 0;
                 for (int r = 0; r < nvf; r++)
-                    if (vf[r].n_vars > 0 || r == first || (vf[r].n_vars == 0 && vf[r].n_vals == 1)) {
+                    if (vf[r].n_vars > 0 || (vf[r].n_vars == 0 && vf[r].n_vals == 1)) {
                         if (w != r) vf[w] = vf[r];
                         w++;
                     }
                 nvf = w;
+                for (int fi=0;fi<nvf;fi++) {
+                }
             }
             free(elim_order);
             free(var_active);
 
-            /* The result scalar is in the remaining factor(s) */
+            /* Multiply all remaining constant factors into the result scalar */
             comp_re = 1.0; comp_im = 0.0;
             for (int fi = 0; fi < nvf; fi++) {
+                if (vf[fi].n_vars > 0) continue; /* skip non-constant factors (shouldn't exist) */
                 double nr = comp_re * vf[fi].re[0] - comp_im * vf[fi].im[0];
                 double ni = comp_re * vf[fi].im[0] + comp_im * vf[fi].re[0];
                 comp_re = nr; comp_im = ni;
@@ -2311,7 +2296,6 @@ static inline uint32_t hpcq_measure(HPCQGraph *g, uint64_t site,
 static inline double hpcq_norm_sq(const HPCQGraph *g)
 {
     if (g->n_sites > 20) {
-        fprintf(stderr, "hpcq_norm_sq: N=%lu too large\n", g->n_sites);
         return -1.0;
     }
 
