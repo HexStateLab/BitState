@@ -141,7 +141,7 @@ static inline void hpcq_amplitude_bethe(const HPCQGraph *g,
         uint64_t xv = indices[g->absorb[mi].center] ^ g->absorb[mi].x_parity;
 
         /* Forward pass */
-        double f_re[64][2], f_im[64][2];
+        double f_re[128][2], f_im[128][2];
         f_re[0][0]=sf_re[mi][0]; f_re[0][1]=sf_re[mi][1];
         f_im[0][0]=sf_im[mi][0]; f_im[0][1]=sf_im[mi][1];
         for (int li = 1; li < L; li++) {
@@ -165,7 +165,7 @@ static inline void hpcq_amplitude_bethe(const HPCQGraph *g,
             }
         }
         /* Backward pass */
-        double b_re[64][2], b_im[64][2];
+        double b_re[128][2], b_im[128][2];
         double lst_re[2], lst_im[2];
         tri_get_amplitudes((TrialityQubit *)&g->locals[g->absorb[mi].center],
                            VIEW_EDGE, lst_re, lst_im);
