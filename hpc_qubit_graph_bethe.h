@@ -193,21 +193,25 @@ static inline void hpcq_amplitude_bethe(const HPCQGraph *g,
                 }
             }
         }
-        /* Marginal = f·b, normalized to probability */
+        /* Marginal = |f·b|² (squared norm), normalized to probability */
         for (int li = 0; li < L; li++) {
-            double p0r=f_re[li][0]*b_re[li][0]-f_im[li][0]*b_im[li][0];
-            double p0i=f_re[li][0]*b_im[li][0]+f_im[li][0]*b_re[li][0];
-            double p1r=f_re[li][1]*b_re[li][1]-f_im[li][1]*b_im[li][1];
-            double p1i=f_re[li][1]*b_im[li][1]+f_im[li][1]*b_re[li][1];
-            double nrm=sqrt(p0r*p0r+p0i*p0i+p1r*p1r+p1i*p1i);
-            if (nrm > 1e-30) { p0r/=nrm; p0i/=nrm; p1r/=nrm; p1i/=nrm; }
-            marg_re[mi][li*2]=p0r;   marg_im[mi][li*2]=p0i;
-            marg_re[mi][li*2+1]=p1r; marg_im[mi][li*2+1]=p1i;
+            double m0r = f_re[li][0]*b_re[li][0] - f_im[li][0]*b_im[li][0];
+            double m0i = f_re[li][0]*b_im[li][0] + f_im[li][0]*b_re[li][0];
+            double m1r = f_re[li][1]*b_re[li][1] - f_im[li][1]*b_im[li][1];
+            double m1i = f_re[li][1]*b_im[li][1] + f_im[li][1]*b_re[li][1];
+            double p0 = m0r*m0r + m0i*m0i;  /* |f(0)·b(0)|² */
+            double p1 = m1r*m1r + m1i*m1i;  /* |f(1)·b(1)|² */
+            double nrm = p0 + p1;
+            if (nrm > 1e-300) { p0 /= nrm; p1 /= nrm; }
+            else { p0 = 0.5; p1 = 0.5; }
+            marg_re[mi][li*2]   = p0;  marg_im[mi][li*2]   = 0.0;
+            marg_re[mi][li*2+1] = p1;  marg_im[mi][li*2+1] = 0.0;
         }
     }
 
     /* ── Per-center chain amplitude (no cc edges yet) ── */
-    double comp_re = 1.0, comp_im = 0.0;
+    double comp_log = 0.0;  /* log-magnitude to avoid underflow */
+    double comp_re_sign = 1.0, comp_im_sign = 0.0;  /* unit phase */
     for (uint64_t mi = 0; mi < n_absorb; mi++) {
         int L = marg_L[mi]; if (L < 1) continue;
         uint64_t xv = indices[g->absorb[mi].center] ^ g->absorb[mi].x_parity;
@@ -244,51 +248,74 @@ static inline void hpcq_amplitude_bethe(const HPCQGraph *g,
         double H0=SQ, H1=(xv==0?SQ:-SQ);
         double sr=H0*(pr*c_re[0]-pi*c_im[0])+H1*(pr*c_re[1]-pi*c_im[1]);
         double si=H0*(pr*c_im[0]+pi*c_re[0])+H1*(pr*c_im[1]+pi*c_re[1]);
-        double nr=comp_re*sr-comp_im*si;
-        comp_im=comp_re*si+comp_im*sr; comp_re=nr;
+        /* Multiply into accumulator in log-scale */
+        double mag = sqrt(sr*sr + si*si);
+        if (mag > 1e-300) {
+            comp_log += log(mag);
+            double nr = comp_re_sign*(sr/mag) - comp_im_sign*(si/mag);
+            comp_im_sign = comp_re_sign*(si/mag) + comp_im_sign*(sr/mag);
+            comp_re_sign = nr;
+            /* Keep phase vector normalized */
+            double ns = sqrt(comp_re_sign*comp_re_sign + comp_im_sign*comp_im_sign);
+            if (ns > 1e-300) { comp_re_sign /= ns; comp_im_sign /= ns; }
+        }
     }
+    double comp_re = exp(comp_log) * comp_re_sign;
+    double comp_im = exp(comp_log) * comp_im_sign;
 
-    /* ── Per-cc-edge expected weight: Σ p_a(ya)p_b(yb)w(ya,yb) ── */
+    /* ── Per-(center,layer) joint cc-edge weight ──
+     * For CZ: w(0,·)=1, w(1,·)=(+1,-1).  Edges at the same (center, layer)
+     * share one inner variable; their weights must be multiplied before
+     * marginalizing: joint = p_a(0)*1 + p_a(1)*Π (p_b(0)-p_b(1)).
+     * Each edge is only included at the smaller-index center to avoid
+     * double counting. */
     for (uint64_t mi = 0; mi < n_absorb; mi++) {
         uint64_t a = mi;
-        for (uint64_t k = 0; k < g->absorb[a].n_nbrs; k++) {
-            uint64_t nb = g->absorb[a].nbrs[k];
-            int64_t aj = g->absorb_idx[nb];
-            if (aj < 0) continue;
-            if (a >= (uint64_t)aj) continue;  /* apply once per edge */
-            int li = (int)g->absorb[a].layer[k];
-            /* Order-match: i-th occurrence */
-            int occ_a = 0;
-            for (uint64_t kk = 0; kk <= k; kk++)
-                if (g->absorb[a].nbrs[kk] == nb) occ_a++;
-            int occ_b = 0, lj = -1;
-            for (uint64_t k2 = 0; k2 < g->absorb[(uint64_t)aj].n_nbrs; k2++) {
-                if (g->absorb[(uint64_t)aj].nbrs[k2] == g->absorb[a].center) {
-                    occ_b++;
-                    if (occ_b == occ_a) {
-                        lj = (int)g->absorb[(uint64_t)aj].layer[k2]; break;
+        int L = marg_L[mi]; if (L < 1) continue;
+        /* For each layer, collect the product of partner E[1] values */
+        for (int li = 0; li < L; li++) {
+            double prod_y1 = 1.0;  /* Π (p_b(0)-p_b(1)) for ya=1 */
+            int n_edges = 0;
+            for (uint64_t k = 0; k < g->absorb[a].n_nbrs; k++) {
+                if ((int)g->absorb[a].layer[k] != li) continue;
+                uint64_t nb = g->absorb[a].nbrs[k];
+                int64_t bj = g->absorb_idx[nb];
+                if (bj < 0) continue;
+                uint64_t b = (uint64_t)bj;
+                /* Only include edges where a < b (smaller index) */
+                if (a >= b) continue;
+                /* Order-match to find partner layer lj */
+                int occ_a = 0;
+                for (uint64_t kk = 0; kk <= k; kk++)
+                    if (g->absorb[a].nbrs[kk] == nb) occ_a++;
+                int occ_b = 0, lj = -1;
+                for (uint64_t k2 = 0; k2 < g->absorb[b].n_nbrs; k2++) {
+                    if (g->absorb[b].nbrs[k2] == g->absorb[a].center) {
+                        occ_b++;
+                        if (occ_b == occ_a) {
+                            lj = (int)g->absorb[b].layer[k2]; break;
+                        }
                     }
                 }
+                if (lj < 0) continue;
+                double pb0 = marg_re[b][lj*2], pb1 = marg_re[b][lj*2+1];
+                prod_y1 *= (pb0 - pb1);
+                n_edges++;
             }
-            if (lj < 0) continue;
-            double ew_r = 0, ew_i = 0;
-            for (int ya = 0; ya < 2; ya++) {
-                for (int yb = 0; yb < 2; yb++) {
-                    int wk = (int)k*4 + ya*2 + yb;
-                    double wr = g->absorb[a].w_re[wk];
-                    double wi = g->absorb[a].w_im[wk];
-                    double pa_r = marg_re[mi][li*2+ya];
-                    double pa_i = marg_im[mi][li*2+ya];
-                    double pb_r = marg_re[(uint64_t)aj][lj*2+yb];
-                    double pb_i = marg_im[(uint64_t)aj][lj*2+yb];
-                    double p_r = pa_r*pb_r - pa_i*pb_i;
-                    double p_i = pa_r*pb_i + pa_i*pb_r;
-                    ew_r += wr*p_r - wi*p_i;
-                    ew_i += wr*p_i + wi*p_r;
-                }
+            if (n_edges == 0) continue;
+            double p0 = marg_re[mi][li*2], p1 = marg_re[mi][li*2+1];
+            double joint = p0 + p1 * prod_y1;
+            double mr = joint, mi_j = 0.0;  /* joint is real for real marginals */
+            double mag = (mr > 0 ? mr : -mr);
+            if (mag > 1e-300) {
+                comp_log += log(mag);
+                double nr = comp_re_sign*(mr/mag) - comp_im_sign*(mi_j/mag);
+                comp_im_sign = comp_re_sign*(mi_j/mag) + comp_im_sign*(mr/mag);
+                comp_re_sign = nr;
+                double ns = sqrt(comp_re_sign*comp_re_sign + comp_im_sign*comp_im_sign);
+                if (ns > 1e-300) { comp_re_sign /= ns; comp_im_sign /= ns; }
+                else { comp_re_sign = 1.0; comp_im_sign = 0.0; }
             }
-            double nr=comp_re*ew_r-comp_im*ew_i;
-            comp_im=comp_re*ew_i+comp_im*ew_r; comp_re=nr;
         }
     }
 
@@ -324,13 +351,31 @@ static inline void hpcq_amplitude_bethe(const HPCQGraph *g,
                 ew_r += wr*pa_r - wi*pa_i;
                 ew_i += wr*pa_i + wi*pa_r;
             }
-            double nr=comp_re*ew_r-comp_im*ew_i;
-            comp_im=comp_re*ew_i+comp_im*ew_r; comp_re=nr;
+            /* Multiply into accumulator in log-scale */
+            double mag = sqrt(ew_r*ew_r + ew_i*ew_i);
+            if (mag > 1e-300) {
+                comp_log += log(mag);
+                double nr = comp_re_sign*(ew_r/mag) - comp_im_sign*(ew_i/mag);
+                comp_im_sign = comp_re_sign*(ew_i/mag) + comp_im_sign*(ew_r/mag);
+                comp_re_sign = nr;
+                double ns = sqrt(comp_re_sign*comp_re_sign + comp_im_sign*comp_im_sign);
+                if (ns > 1e-300) { comp_re_sign /= ns; comp_im_sign /= ns; }
+                else { comp_re_sign = 1.0; comp_im_sign = 0.0; }
+            }
         }
     }
 
-    *out_re = re*comp_re - im*comp_im;
-    *out_im = re*comp_im + im*comp_re;
+    /* Reconstruct amplitude from log-scale; fall back to log output */
+    if (comp_log > -700.0) {
+        double comp_re = exp(comp_log) * comp_re_sign;
+        double comp_im = exp(comp_log) * comp_im_sign;
+        *out_re = re*comp_re - im*comp_im;
+        *out_im = re*comp_im + im*comp_re;
+    } else {
+        /* Amplitude below double precision — return log-magnitude and phase */
+        *out_re = comp_log;
+        *out_im = atan2(comp_im_sign, comp_re_sign);
+    }
 
     /* Cleanup */
     for (uint64_t a = 0; a < n_absorb; a++) {
