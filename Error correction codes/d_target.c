@@ -8,9 +8,10 @@
  *
  * No artificial caps. Specify any D.
  *
- * Usage: ./d_target --D 100    # all codes with D ≥ 100
- *         ./d_target --D 50 --k 1     # k=1 only
- *         ./d_target --D 20 --full    # include full verification
+ * Usage: ./d_target --D 100              # D ≥ 100
+ *         ./d_target --D 20 --rate 0.1     # D ≥ 20, rate ≥ 0.1
+ *         ./d_target --D 12 --rate 0.1 -k 2 # k=2 only
+ *         ./d_target --rate 0.15            # all codes rate ≥ 0.15
  */
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -72,18 +73,20 @@ static int gen_code(int L, int r, poly g, poly *fac, int *fdeg, int nf, poly *oa
 }
 
 int main(int argc, char **argv){
-    int target_D=0, k_mode=0, full=0;
+    int target_D=0, k_mode=0;
+    double min_rate=0.0;
     for(int i=1;i<argc;i++){
         if(!strcmp(argv[i],"--D")&&i+1<argc)target_D=atoi(argv[++i]);
         else if(!strcmp(argv[i],"--k")&&i+1<argc)k_mode=atoi(argv[++i]);
-        else if(!strcmp(argv[i],"--full"))full=1;
+        else if(!strcmp(argv[i],"--rate")&&i+1<argc)min_rate=atof(argv[++i]);
     }
-    if(!target_D){printf("Usage: ./d_target --D <distance> [--k 1|2] [--full]\n");return 0;}
+    if(!target_D&&min_rate<=0){printf("Usage: ./d_target --D <d> [--rate <r>] [--k 1|2]\n");return 0;}
+    if(!target_D)target_D=3;
     rng[0]=(uint64_t)time(NULL)^0xCAFE;rng[1]=rng[0]^0xBABE;
     
-    printf("Target: D ≥ %d\n\n",target_D);
-    printf("%4s %3s %3s %4s %4s %7s %7s %s\n","N","m","k","K","D","Rate","StabWt","Note");
-    printf("%s\n","──────────────────────────────────────────────");
+    printf("Target: D ≥ %d, rate ≥ %.3f\n\n",target_D,min_rate);
+    printf("%5s %4s %3s %4s %4s %8s %7s %s\n","N","K","k","D","L/2","Rate","StabWt","Polynomials (a, b)");
+    printf("%s\n","──────────────────────────────────────────────────────────────────");
     int count=0;
     
     /* ── k=1: ALWAYS works for any odd m. D = m, N = 4m, rate = 1/m ── */
@@ -107,16 +110,21 @@ int main(int argc, char **argv){
                 D_actual = min_w;
             }
             if(D_actual < target_D) continue;
+            { double rate=(double)K/N; if(rate<min_rate)continue; }
             
-            poly a=0,b=0; int sw=0;
+            poly a_poly=0, b_poly=0; int sw=0;
             if(L <= 120){
                 poly fa[2]={3}; int fd[2]={1};
-                gen_code(L,r,g,fa,fd,1,&a,&b);
-                sw=pwt(a)+pwt(b);
+                gen_code(L,r,g,fa,fd,1,&a_poly,&b_poly);
+                sw=pwt(a_poly)+pwt(b_poly);
             }
-            printf("%4d %3d %3d %4d %4d %7.3f %7d k=1:∀odd-m%s\n",
-                   N,m,1,K,D_actual,(double)K/N,sw,
-                   L>120?" (theorem)":""); count++;
+            printf("%5d %4d %3d %4d %8.3f %7d",
+                   N,K,1,D_actual,(double)K/N,sw);
+            if(L<=120&&a_poly)
+                printf(" a=0x%016lx b=0x%016lx",(uint64_t)a_poly,(uint64_t)b_poly);
+            else
+                printf(" (L>120, theorem)");
+            printf("\n"); count++;
         }
     }
 
@@ -135,12 +143,17 @@ int main(int argc, char **argv){
                     if(deg_sum!=r)continue;
                     int D=compute_D(m,k,c,fac,fdeg,nf);
                     if(D<target_D)continue;
+                    { double rate=(double)(2*r)/(2*L); if(rate<min_rate)continue; }
                     poly g=1;for(int i=0;i<nf;i++)for(int j=0;j<c[i];j++)g=pmul(g,fac[i]);
-                    poly a,b;
-                    if(gen_code(L,r,g,fac,fdeg,nf,&a,&b)){
-                        char gd[64]={0},*p=gd;
-                        for(int i=0;i<nf;i++)if(c[i]>0)p+=sprintf(p,"d%d^%d ",fdeg[i],c[i]);
-                        printf("%4d %3d %3d %4d %4d %7.3f %7d k=2 %s\n",2*L,m,k,2*r,D,(double)(2*r)/(2*L),pwt(a)+pwt(b),gd);count++;
+                    poly a_poly,b_poly;
+                    if(gen_code(L,r,g,fac,fdeg,nf,&a_poly,&b_poly)){
+                        printf("%5d %4d %3d %4d %8.3f %7d a=0x%016lx b=0x%016lx",
+                               2*L,2*r,k,D,(double)(2*r)/(2*L),pwt(a_poly)+pwt(b_poly),
+                               (uint64_t)a_poly,(uint64_t)b_poly);
+                        /* gcd desc */
+                        printf(" [");
+                        for(int i=0;i<nf;i++)if(c[i]>0)printf("d%d^%d ",fdeg[i],c[i]);
+                        printf("]\n"); count++;
                     }
                 }
             }
