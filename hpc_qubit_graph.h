@@ -1582,7 +1582,7 @@ static inline void hpcq_amplitude(const HPCQGraph *g,
 
             #define VE_MAX_VARS 128
             #define VE_MAX_VARS 128
-            #define VE_MAX_SCOPE 12
+            #define VE_MAX_SCOPE 16
             #define VE_MAX_NVALS (1 << VE_MAX_SCOPE)
 
             int ve_max_factors = 4096;
@@ -1601,7 +1601,7 @@ static inline void hpcq_amplitude(const HPCQGraph *g,
                 f->re[0]=(v0r); f->im[0]=(v0i); f->re[1]=(v1r); f->im[1]=(v1i); \
             } while(0)
 
-            /* Helper: multiply two factors, store in vf[nvf] */
+            /* Helper: multiply two factors, store in vf[nvf]              */
             #define ve_mul(fi, fj) do { \
                 VE_CHECK(); VE_F *fa = &vf[(fi)], *fb = &vf[(fj)]; \
                 VE_F *fc = &vf[nvf]; memset(fc,0,sizeof(VE_F)); nvf++; \
@@ -1616,28 +1616,42 @@ static inline void hpcq_amplitude(const HPCQGraph *g,
                 fc->n_vars = ni; fc->n_vals = 1 << ni; \
                 memset(fc->re, 0, fc->n_vals * sizeof(double)); \
                 memset(fc->im, 0, fc->n_vals * sizeof(double)); \
-                for (int a2 = 0; a2 < fb->n_vals; a2++) { \
-                    uint64_t fb_assign = 0; \
-                    for (int k = 0; k < fb->n_vars; k++) \
-                        fb_assign |= ((a2 >> k) & 1) << fb->vars[k]; \
-                    for (int a1 = 0; a1 < fa->n_vals; a1++) { \
-                        int ok = 1; uint64_t fa_assign = 0; \
-                        for (int k = 0; k < fa->n_vars; k++) { \
-                            int bit = (a1 >> k) & 1; \
-                            fa_assign |= bit << fa->vars[k]; \
-                            for (int j = 0; j < fb->n_vars; j++) \
-                                if (fa->vars[k] == fb->vars[j]) { \
-                                    if (bit != ((fb_assign >> fb->vars[j]) & 1)) ok = 0; \
-                                    break; \
-                                } \
+                /* Pre-map: for each position in fa/fb, find position in fc */ \
+                int fa2fc[12], fb2fc[12]; \
+                for (int ka = 0; ka < fa->n_vars; ka++) { \
+                    for (int kc = 0; kc < ni; kc++) \
+                        if (fc->vars[kc] == fa->vars[ka]) { fa2fc[ka] = kc; break; } \
+                } \
+                for (int kb = 0; kb < fb->n_vars; kb++) { \
+                    for (int kc = 0; kc < ni; kc++) \
+                        if (fc->vars[kc] == fb->vars[kb]) { fb2fc[kb] = kc; break; } \
+                } \
+                /* Find shared variable positions: which fa[k] == fb[j] ? */ \
+                int shr_a[12], shr_b[12]; int n_shr = 0; \
+                for (int ka = 0; ka < fa->n_vars; ka++) \
+                    for (int kb = 0; kb < fb->n_vars; kb++) \
+                        if (fa->vars[ka] == fb->vars[kb]) { \
+                            shr_a[n_shr]=ka; shr_b[n_shr]=kb; n_shr++; } \
+                for (int a1 = 0; a1 < fa->n_vals; a1++) { \
+                    for (int a2 = 0; a2 < fb->n_vals; a2++) { \
+                        /* Check shared variables agree */ \
+                        int ok = 1; \
+                        for (int s = 0; s < n_shr; s++) { \
+                            if (((a1>>shr_a[s])&1) != ((a2>>shr_b[s])&1)) { ok=0; break; } \
                         } \
                         if (!ok) continue; \
-                        uint64_t full = fa_assign | fb_assign; \
-                        uint64_t idx = 0; \
-                        for (int k = 0; k < ni; k++) \
-                            idx |= ((full >> fc->vars[k]) & 1) << k; \
-                        fc->re[idx] += fa->re[a1] * fb->re[a2] - fa->im[a1] * fb->im[a2]; \
-                        fc->im[idx] += fa->re[a1] * fb->im[a2] + fa->im[a1] * fb->re[a2]; \
+                        /* Build output index from non-shared bits */ \
+                        uint64_t out_idx = 0; \
+                        for (int kc = 0; kc < ni; kc++) { \
+                            uint64_t bit = 0; \
+                            for (int ka = 0; ka < fa->n_vars; ka++) \
+                                if (fa2fc[ka] == kc) bit = (a1>>ka)&1; \
+                            for (int kb = 0; kb < fb->n_vars; kb++) \
+                                if (fb2fc[kb] == kc) bit = (a2>>kb)&1; \
+                            out_idx |= bit << kc; \
+                        } \
+                        fc->re[out_idx] += fa->re[a1] * fb->re[a2] - fa->im[a1] * fb->im[a2]; \
+                        fc->im[out_idx] += fa->re[a1] * fb->im[a2] + fa->im[a1] * fb->re[a2]; \
                     } \
                 } \
             } while(0)
@@ -1720,9 +1734,24 @@ static inline void hpcq_amplitude(const HPCQGraph *g,
                     if (mi2 == sz) continue;
                     if (a >= aj) continue;
                     int li = (int)g->absorb[a].layer[k];
-                    if (li >= (int)var_count[mi] || li >= (int)var_count[mi2]) continue;
+                    if (li >= (int)var_count[mi]) continue;
+                    /* Order-match to find partner's layer */
+                    int occ_a = 0;
+                    for (uint64_t kk = 0; kk <= k; kk++)
+                        if (g->absorb[a].nbrs[kk] == nb) occ_a++;
+                    int occ_b = 0, lj = -1;
+                    for (uint64_t k2 = 0; k2 < g->absorb[aj].n_nbrs; k2++) {
+                        if (g->absorb[aj].nbrs[k2] == g->absorb[a].center) {
+                            occ_b++;
+                            if (occ_b == occ_a) {
+                                lj = (int)g->absorb[aj].layer[k2]; break;
+                            }
+                        }
+                    }
+                    if (lj < 0) continue;
+                    if (lj >= (int)var_count[mi2]) continue;
                     uint64_t va = var_start[mi] + li;
-                    uint64_t vb = var_start[mi2] + li;
+                    uint64_t vb = var_start[mi2] + lj;
                     uint64_t ca = g->absorb[a].center, cb = nb;
                     double xp_va = 0, xp_vb = 0;
                     for (uint64_t ee = 0; ee < g->n_edges; ee++) {
@@ -1794,32 +1823,29 @@ static inline void hpcq_amplitude(const HPCQGraph *g,
                 }
             }
 
-            /* Eliminate variables using min-degree ordering */
+            /* Eliminate variables per-center, deepest-layer-first.
+             * For each center, eliminate its inner variables from deepest
+             * to shallowest.  This keeps the boundary at ~2 × grid_width,
+             * since each active neighbor contributes at most one boundary
+             * variable per center-layer-connection. */
             int *elim_order = (int *)calloc(total_vars, sizeof(int));
             int *var_active = (int *)calloc(total_vars, sizeof(int));
             for (uint64_t i = 0; i < total_vars; i++) var_active[i] = (int)active[i];
             free(active);
 
             int n_elim = 0;
-            for (uint64_t i = 0; i < total_vars; i++) {
-                if (!var_active[i]) continue;
-                /* Find variable with minimum factor scope product (min-degree heuristic) */
-                int best_v = -1; uint64_t best_cost = (uint64_t)-1;
-                for (uint64_t v = 0; v < total_vars; v++) {
-                    if (!var_active[v]) continue;
-                    uint64_t cost = 1;
-                    for (int fi = 0; fi < nvf; fi++) {
-                        for (int k = 0; k < vf[fi].n_vars; k++)
-                            if (vf[fi].vars[k] == v) {
-                                cost *= (uint64_t)vf[fi].n_vals;
-                                break;
-                            }
-                    }
-                    if (cost < best_cost) { best_cost = cost; best_v = (int)v; }
+            for (uint64_t mi = 0; mi < sz; mi++) {
+                uint64_t vs = var_start[mi];
+                int vc = (int)var_count[mi];
+                for (int li = vc - 1; li >= 0; li--) {
+                    int v = (int)(vs + li);
+                    if (v < (int)total_vars) elim_order[n_elim++] = v;
                 }
-                if (best_v < 0) break;
-                elim_order[n_elim++] = best_v;
-                int v = best_v;
+            }
+            for (uint64_t i = 0; i < total_vars; i++) var_active[i] = 1;
+            /* Elimination loop — process in stored order */
+            for (int ei = 0; ei < n_elim; ei++) {
+                int v = elim_order[ei];
                 var_active[v] = 0;
 
                 /* Find all factors containing v, multiply them, sum out v */
@@ -1830,50 +1856,54 @@ static inline void hpcq_amplitude(const HPCQGraph *g,
                         if (vf[fi].vars[k] == (uint64_t)v) { found = 1; break; }
                     if (!found) continue;
                     if (first < 0) { first = fi; continue; }
-                    /* Multiply vf[fi] into vf[first] */
-                    int sav_nvf = nvf;
-                    /* Use temporary factor */
-                    VE_F tmp = vf[first];
-                    /* Recompute first = tmp * vf[fi] */
-                    VE_F *fa = &tmp, *fb = &vf[fi];
-                    VE_F *fc = &vf[first]; memset(fc,0,sizeof(VE_F));
-                    int ni=0, ia=0, ib=0;
-                    while (ia < fa->n_vars || ib < fb->n_vars) {
-                        if (ib>=fb->n_vars || (ia<fa->n_vars && fa->vars[ia]<fb->vars[ib]))
-                            fc->vars[ni++] = fa->vars[ia++];
-                        else if (ia>=fa->n_vars || (ib<fb->n_vars && fb->vars[ib]<fa->vars[ia]))
-                            fc->vars[ni++] = fb->vars[ib++];
-                        else { fc->vars[ni++] = fa->vars[ia]; ia++; ib++; }
-                    }
-                    fc->n_vars = ni; fc->n_vals = 1 << ni;
-                    memset(fc->re, 0, fc->n_vals * sizeof(double));
-                    memset(fc->im, 0, fc->n_vals * sizeof(double));
-                    for (int a2 = 0; a2 < fb->n_vals; a2++) {
-                        uint64_t fb_assign = 0;
-                        for (int k = 0; k < fb->n_vars; k++)
-                            fb_assign |= ((a2 >> k) & 1) << fb->vars[k];
+                    /* Multiply vf[fi] into vf[first] — scope-local indexing */
+                    {
+                        VE_F tmp = vf[first];
+                        VE_F *fa = &tmp, *fb = &vf[fi];
+                        VE_F *fc = &vf[first]; memset(fc,0,sizeof(VE_F));
+                        int ni=0, ia=0, ib=0;
+                        while (ia < fa->n_vars || ib < fb->n_vars) {
+                            if (ib>=fb->n_vars || (ia<fa->n_vars && fa->vars[ia]<fb->vars[ib]))
+                                fc->vars[ni++] = fa->vars[ia++];
+                            else if (ia>=fa->n_vars || (ib<fb->n_vars && fb->vars[ib]<fa->vars[ia]))
+                                fc->vars[ni++] = fb->vars[ib++];
+                            else { fc->vars[ni++] = fa->vars[ia]; ia++; ib++; }
+                        }
+                        fc->n_vars = ni; fc->n_vals = 1 << ni;
+                        memset(fc->re, 0, fc->n_vals * sizeof(double));
+                        memset(fc->im, 0, fc->n_vals * sizeof(double));
+                        int fa2fc[16], fb2fc[16];
+                        for (int ka = 0; ka < fa->n_vars; ka++)
+                            for (int kc = 0; kc < ni; kc++)
+                                if (fc->vars[kc] == fa->vars[ka]) { fa2fc[ka] = kc; break; }
+                        for (int kb = 0; kb < fb->n_vars; kb++)
+                            for (int kc = 0; kc < ni; kc++)
+                                if (fc->vars[kc] == fb->vars[kb]) { fb2fc[kb] = kc; break; }
+                        int shr_a[16], shr_b[16], n_shr = 0;
+                        for (int ka = 0; ka < fa->n_vars; ka++)
+                            for (int kb = 0; kb < fb->n_vars; kb++)
+                                if (fa->vars[ka] == fb->vars[kb])
+                                    { shr_a[n_shr]=ka; shr_b[n_shr]=kb; n_shr++; }
                         for (int a1 = 0; a1 < fa->n_vals; a1++) {
-                            int ok = 1; uint64_t fa_assign = 0;
-                            for (int k = 0; k < fa->n_vars; k++) {
-                                int bit = (a1 >> k) & 1;
-                                fa_assign |= bit << fa->vars[k];
-                                for (int j = 0; j < fb->n_vars; j++)
-                                    if (fa->vars[k] == fb->vars[j]) {
-                                        if (bit != ((fb_assign >> fb->vars[j]) & 1)) ok = 0;
-                                        break;
-                                    }
+                            for (int a2 = 0; a2 < fb->n_vals; a2++) {
+                                int ok = 1;
+                                for (int s = 0; s < n_shr; s++)
+                                    if (((a1>>shr_a[s])&1) != ((a2>>shr_b[s])&1)) { ok=0; break; }
+                                if (!ok) continue;
+                                uint64_t out_idx = 0;
+                                for (int kc = 0; kc < ni; kc++) {
+                                    uint64_t bit = 0;
+                                    for (int ka = 0; ka < fa->n_vars; ka++)
+                                        if (fa2fc[ka] == kc) bit = (a1>>ka)&1;
+                                    for (int kb = 0; kb < fb->n_vars; kb++)
+                                        if (fb2fc[kb] == kc) bit = (a2>>kb)&1;
+                                    out_idx |= bit << kc;
+                                }
+                                fc->re[out_idx] += fa->re[a1] * fb->re[a2] - fa->im[a1] * fb->im[a2];
+                                fc->im[out_idx] += fa->re[a1] * fb->im[a2] + fa->im[a1] * fb->re[a2];
                             }
-                            if (!ok) continue;
-                            uint64_t full = fa_assign | fb_assign;
-                            uint64_t idx = 0;
-                            for (int k = 0; k < ni; k++)
-                                idx |= ((full >> fc->vars[k]) & 1) << k;
-                            fc->re[idx] += fa->re[a1] * fb->re[a2] - fa->im[a1] * fb->im[a2];
-                            fc->im[idx] += fa->re[a1] * fb->im[a2] + fa->im[a1] * fb->re[a2];
                         }
                     }
-                    /* Mark vf[fi] as inactive by swapping with last */
-                    /* For simplicity, just mark it; we'll compact later if needed */
                     vf[fi].n_vars = 0; /* invalid */
                 }
                 /* Now sum out v from vf[first] */
