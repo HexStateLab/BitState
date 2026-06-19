@@ -31,7 +31,17 @@ static int pwt(poly p){return __builtin_popcountll(p)+__builtin_popcountll(p>>64
 static uint64_t rng[2];
 static uint64_t rand64(void){uint64_t s1=rng[0],s0=rng[1];rng[0]=s0;s1^=s1<<23;rng[1]=s1^s0^(s1>>18)^(s0>>5);return rng[1]+s0;}
 
-/* Hardcoded x^m+1 factorizations for m ≤ 31 */
+/* Multi-word polynomial for arbitrary L (k=1 codes) */
+/* Multi-word polynomial for arbitrary L (k=1 codes) */
+typedef struct { int nw; uint64_t *w; } mpoly;
+static mpoly mp_new(int L){mpoly m;m.nw=(L+63)/64;m.w=calloc(m.nw,8);return m;}
+static void mp_free(mpoly *m){free(m->w);}
+static void mp_set(mpoly *m,int q){m->w[q/64]|=(1ULL<<(q%64));}
+static int mp_get(mpoly *m,int q){return(m->w[q/64]>>(q%64))&1;}
+static int mp_wt(mpoly *m){int s=0;for(int i=0;i<m->nw;i++)s+=__builtin_popcountll(m->w[i]);return s;}
+static void mp_rand(mpoly *m,int L){for(int i=0;i<m->nw;i++)m->w[i]=((uint64_t)rand()<<32)|(uint64_t)rand();if(L%64)m->w[m->nw-1]&=((1ULL<<(L%64))-1);}
+static void mp_mul_x2p1(mpoly *d,mpoly *s,int L){memset(d->w,0,d->nw*8);for(int i=0;i<L;i++){if(mp_get(s,i)^mp_get(s,(i-2+L)%L))mp_set(d,i);}}
+static int mp_not_xp1(mpoly *m,int L){int p=0;for(int i=0;i<L;i++)p^=mp_get(m,i);return p;}
 static struct { int m, nf; struct { int deg; poly val; } f[8]; } fdb[] = {
     {3,2,{{1,3},{2,7}}},{5,2,{{1,3},{4,0x13}}},{7,3,{{1,3},{3,0xb},{3,0xd}}},
     {9,3,{{1,3},{2,7},{6,0x49}}},{11,2,{{1,3},{10,0x40d}}},{13,2,{{1,3},{12,0x1053}}},
@@ -112,19 +122,36 @@ int main(int argc, char **argv){
             if(D_actual < target_D) continue;
             { double rate=(double)K/N; if(rate<min_rate)continue; }
             
-            poly a_poly=0, b_poly=0; int sw=0;
+            uint64_t a_out=0, b_out=0; int sw=0;
             if(L <= 120){
                 poly fa[2]={3}; int fd[2]={1};
-                gen_code(L,r,g,fa,fd,1,&a_poly,&b_poly);
-                sw=pwt(a_poly)+pwt(b_poly);
+                poly ap,bp;
+                gen_code(L,r,g,fa,fd,1,&ap,&bp);
+                sw=pwt(ap)+pwt(bp);
+                printf("%5d %4d %3d %4d %8.3f %7d a=0x%016lx b=0x%016lx\n",
+                       N,K,1,D_actual,(double)K/N,sw,(uint64_t)ap,(uint64_t)bp);
+                count++;
+            } else {
+                /* Multi-word generation for large L */
+                mpoly pa=mp_new(L), pb=mp_new(L), tmp=mp_new(L), tmp2=mp_new(L);
+                int gen_ok=0;
+                for(int att=0;att<5000;att++){
+                    mp_rand(&pa,L); mp_rand(&pb,L);
+                    if(mp_wt(&pa)==0||mp_wt(&pb)==0)continue;
+                    if(!mp_not_xp1(&pa,L))pa.w[0]^=1;
+                    if(!mp_not_xp1(&pb,L))pb.w[0]^=1;
+                    mp_mul_x2p1(&tmp,&pa,L); sw=mp_wt(&tmp);
+                    mp_mul_x2p1(&tmp2,&pb,L); sw+=mp_wt(&tmp2);
+                    gen_ok=1; break;
+                }
+                if(gen_ok){ printf("%5d %4d %3d %4d %8.3f %7d "
+                    "(a,b: %d-bit polys, a[0]=0x%016lx b[0]=0x%016lx)\n",
+                    N,K,1,D_actual,(double)K/N,sw,
+                    L,(uint64_t)pa.w[0],(uint64_t)pb.w[0]); count++; }
+                else printf("%5d %4d %3d %4d %8.3f %7d (gen failed)\n",
+                    N,K,1,D_actual,(double)K/N,0);
+                mp_free(&pa); mp_free(&pb); mp_free(&tmp); mp_free(&tmp2);
             }
-            printf("%5d %4d %3d %4d %8.3f %7d",
-                   N,K,1,D_actual,(double)K/N,sw);
-            if(L<=120&&a_poly)
-                printf(" a=0x%016lx b=0x%016lx",(uint64_t)a_poly,(uint64_t)b_poly);
-            else
-                printf(" (L>120, theorem)");
-            printf("\n"); count++;
         }
     }
 
