@@ -21,9 +21,11 @@
 | Polynomials | a(x) = 0xc23afc4, b(x) = 0xa7de976 |
 | gcd(a,b,x²⁸+1) degree | 4 → K = 2·4 = 8 |
 | rank(HX) = rank(HZ) | 24 / 28 |
-| Stabilizer weight | **23 (perfectly uniform)** — all 56 checks |
+| Stabilizer weight | **32 (perfectly uniform)** — all 56 checks |
 | HPC graph memory | ~6.3 KB |
 | State vector | 2^56 × 16B ≈ 1.15 exabytes |
+| Polynomial weights | wt(a) = 14, wt(b) = 18 → combined row wt = 32 |
+| Qubit degree | 14 X-checks + 18 Z-checks = 32 per qubit (uniform) |
 
 ## Comparison
 
@@ -88,14 +90,16 @@ a polynomial in the ideal ⟨h(x)⟩ mod x²⁸+1. With deg(g) = 4, there are ex
 
 ## Stabilizer Weights
 
-All 28 HX stabilizers have weight **exactly 23**. All 28 HZ stabilizers also
-have weight 23. Perfect uniformity — every check has identical circuit depth.
+All 28 HX stabilizers have weight **exactly 32** (wt(a)=14 + wt(b)=18).
+All 28 HZ stabilizers also have weight 32. Perfect uniformity — every check
+has identical circuit depth. Each qubit participates in exactly 14 X-checks
+and 18 Z-checks, for a total of 32 checks per qubit — also perfectly regular.
 
 ## Stabilizer Matrix
 
-### HX (28 rows × 56 bits)
+### HX (28 rows × 56 bits, weight 32 each)
 
-Each row = [A_block (28 bits) | B_block (28 bits)]
+Each row = [A_block (28 bits, wt=14) | B_block (28 bits, wt=18)]
 
 ```
 [01100001000111010111111000100101001111101111010010111011]
@@ -128,9 +132,9 @@ Each row = [A_block (28 bits) | B_block (28 bits)]
 [11000010001110101111110001001010011111011110100101110110]
 ```
 
-### HZ (28 rows × 56 bits)
+### HZ (28 rows × 56 bits, weight 32 each)
 
-Each row = [B^T_block (28 bits) | A^T_block (28 bits)]
+Each row = [B^T_block (28 bits, wt=18) | A^T_block (28 bits, wt=14)]
 
 ```
 [01101110100101111011111001010010001111110101110001000011]
