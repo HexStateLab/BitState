@@ -15,9 +15,9 @@
  * of the 2^deg(g)-element nullspace.  The QFT (Shor's subroutine) reveals
  * this structure by diagonalizing the circulant group algebra.
  *
- * Build: gcc -std=gnu11 -O3 -march=native -o shorts_distance shorts_distance.c -lm
- * Run:   ./shorts_distance               # quick search, exact D for d_g ≤ 22
- *        ./shorts_distance --deep         # deep search, 10M trials
+ * Build: gcc -std=gnu11 -O3 -march=native -o shors_distance shors_distance.c -lm
+ * Run:   ./shors_distance               # quick search, exact D for d_g ≤ 22
+ *        ./shors_distance --deep         # deep search, 10M trials
  */
 #define _GNU_SOURCE
 #include <stdio.h>
